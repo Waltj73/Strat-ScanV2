@@ -1,26 +1,25 @@
-# app.py (v1.1)
-# STRAT Scanner Dashboard (Streamlit) — Ranking Engine (0–100)
+# app.py (v1.2)
+# 2D Scan (STRAT) — Two Scenarios + Tabs + Ranked Output
 #
-# Setup logic:
-#   Monthly context (evaluated month):
-#     2-Down: low < prior low AND high <= prior high
-#     Green: close > open
-#   Daily trigger (latest day):
-#     Failed 2 Down: low < prior low AND high > prior high
-#     Inside Day: high < prior high AND low > prior low
-#   Target: evaluated month high
+# SCENARIO 1 (Pullback-Continuation):
+#   Monthly: 2-Down AND Green
+#   Daily actionable: 2D OR Inside
+#   Target: evaluated month high (prior month high)
 #
-# Probabilities (2-year empirical):
-#   After a 2-down green month, probability price hits that month’s high in the FOLLOWING month.
+# SCENARIO 2 (Trend-Continuation):
+#   Monthly: 2-Up
+#   Daily actionable: 2U OR Inside
+#   Target: evaluated month high (prior month high)
 #
-# Ranking Score (0–100):
-#   Monthly (0–40): 2Down +20, Green +20
-#   Daily (0–30): Failed2 +30, Inside +20
-#   Room (0–15): 1 point per 1% room (cap 15)
-#   Probability (0–15): hit_rate% mapped to 0–15
+# Ranking Score (0–100) for each scenario:
+#   Monthly context points
+#   Daily trigger points
+#   Room-to-target points
+#   Probability points (2-year empirical; see notes below)
 #
-# Universe:
-#   Top 50 mega caps (S&P500 + Nasdaq-100) by market cap, with fallback list.
+# Probability metric (2-year empirical):
+#   After a 2-down green month, probability price hits THAT month’s high during the following month.
+#   (We apply this prob metric as "context quality" even in Scenario 2—optional, but useful.)
 #
 # Requirements (requirements.txt):
 #   streamlit
@@ -39,35 +38,24 @@ import requests
 from io import StringIO
 from datetime import datetime, timezone
 
-st.set_page_config(page_title="2D Scan (STRAT) v1.1", layout="wide")
+st.set_page_config(page_title="2D Scan (STRAT) v1.2", layout="wide")
 
-# -----------------------------
-# Styling (green checkmarks)
-# -----------------------------
 CHECK = "✅"
 XMARK = "—"
+
+def ck(v: bool) -> str:
+    return CHECK if bool(v) else XMARK
 
 st.markdown(
     """
     <style>
-      /* make the dataframe area breathe */
       .stDataFrame { padding-top: 0.25rem; }
-
-      /* nicer headings spacing */
       h1, h2, h3 { margin-bottom: 0.25rem; }
-
-      /* green check emoji fallback (emoji already green, but keep consistent) */
-      .green-check { color: #16a34a; font-weight: 700; }
-
-      /* small muted caption */
       .muted { color: rgba(120,120,120,0.9); font-size: 0.92rem; }
     </style>
     """,
     unsafe_allow_html=True,
 )
-
-def ck(v: bool) -> str:
-    return CHECK if bool(v) else XMARK
 
 # -----------------------------
 # Fallback universe
@@ -87,9 +75,9 @@ def _fetch_html(url: str) -> str:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "AppleWebAlreadyKit/537.36 (KHTML, like Gecko) "
             "Chrome/122.0.0.0 Safari/537.36"
-        )
+        ).replace("AppleWebAlreadyKit", "AppleWebKit")  # safe typo guard
     }
     r = requests.get(url, headers=headers, timeout=25)
     r.raise_for_status()
@@ -99,11 +87,9 @@ def _fetch_html(url: str) -> str:
 def get_sp500_tickers() -> list[str]:
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
     html = _fetch_html(url)
-    tables = pd.read_html(StringIO(html))
-    df = tables[0]
+    df = pd.read_html(StringIO(html))[0]
     tickers = df["Symbol"].astype(str).str.strip().tolist()
-    tickers = [t.replace(".", "-") for t in tickers]
-    return sorted(set(tickers))
+    return sorted(set([t.replace(".", "-") for t in tickers]))
 
 @st.cache_data(ttl=60 * 60 * 24)
 def get_nasdaq100_tickers() -> list[str]:
@@ -132,8 +118,7 @@ def get_nasdaq100_tickers() -> list[str]:
         raise ValueError("Could not locate ticker/symbol column on Nasdaq-100 table.")
 
     tickers = best[ticker_col].astype(str).str.strip().tolist()
-    tickers = [t.replace(".", "-") for t in tickers]
-    return sorted(set(tickers))
+    return sorted(set([t.replace(".", "-") for t in tickers]))
 
 @st.cache_data(ttl=60 * 60 * 12)
 def get_top50_by_marketcap(tickers: list[str]) -> pd.DataFrame:
@@ -151,30 +136,21 @@ def get_top50_by_marketcap(tickers: list[str]) -> pd.DataFrame:
             rows.append({"Ticker": t, "MarketCap": float(mcap)})
         except Exception:
             continue
-
     df = pd.DataFrame(rows).dropna()
-    df = df.sort_values("MarketCap", ascending=False).head(50).reset_index(drop=True)
-    return df
+    return df.sort_values("MarketCap", ascending=False).head(50).reset_index(drop=True)
 
 # -----------------------------
-# Data fetch
+# Data fetch (batch + fallback)
 # -----------------------------
 @st.cache_data(ttl=60 * 15)
 def fetch_batch_daily(tickers: list[str], period: str = "2y") -> dict[str, pd.DataFrame]:
     if not tickers:
         return {}
-
     joined = " ".join(tickers)
     data = yf.download(
-        joined,
-        period=period,
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=False,
-        progress=False,
-        threads=True,
+        joined, period=period, interval="1d",
+        group_by="ticker", auto_adjust=False, progress=False, threads=True
     )
-
     out: dict[str, pd.DataFrame] = {}
 
     if isinstance(data.columns, pd.MultiIndex):
@@ -182,7 +158,7 @@ def fetch_batch_daily(tickers: list[str], period: str = "2y") -> dict[str, pd.Da
             if t in data.columns.get_level_values(0):
                 df = data[t].copy().dropna()
                 df = df.rename(columns=str.title)
-                keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+                keep = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
                 df = df[keep].dropna()
                 df.index = pd.to_datetime(df.index)
                 df = df.sort_index()
@@ -191,7 +167,7 @@ def fetch_batch_daily(tickers: list[str], period: str = "2y") -> dict[str, pd.Da
     else:
         df = data.copy().dropna()
         df = df.rename(columns=str.title)
-        keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+        keep = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
         df = df[keep].dropna()
         df.index = pd.to_datetime(df.index)
         df = df.sort_index()
@@ -201,30 +177,23 @@ def fetch_batch_daily(tickers: list[str], period: str = "2y") -> dict[str, pd.Da
 
 @st.cache_data(ttl=60 * 15)
 def fetch_single_daily(ticker: str, period: str = "2y") -> pd.DataFrame:
-    df = yf.download(
-        ticker,
-        period=period,
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
+    df = yf.download(ticker, period=period, interval="1d",
+                     auto_adjust=False, progress=False, threads=False)
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.rename(columns=str.title)
-    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    keep = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
     df = df[keep].dropna()
     df.index = pd.to_datetime(df.index)
     return df.sort_index()
 
 # -----------------------------
-# STRAT logic
+# STRAT helpers
 # -----------------------------
 def to_monthly_ohlc(daily: pd.DataFrame) -> pd.DataFrame:
     d = daily.copy()
     d.index = pd.to_datetime(d.index)
     d = d.sort_index()
-
     monthly = pd.DataFrame(
         {
             "Open": d["Open"].resample("MS").first(),
@@ -233,57 +202,81 @@ def to_monthly_ohlc(daily: pd.DataFrame) -> pd.DataFrame:
             "Close": d["Close"].resample("MS").last(),
             "Volume": d["Volume"].resample("MS").sum() if "Volume" in d.columns else np.nan,
         }
-    ).dropna(subset=["Open", "High", "Low", "Close"])
+    ).dropna(subset=["Open","High","Low","Close"])
     return monthly
 
-def strat_month_flags(monthly: pd.DataFrame, use_last_completed_month: bool = True) -> dict:
-    if monthly is None or monthly.empty or len(monthly) < 3:
-        return {"ok": False}
-
+def pick_eval_month(monthly: pd.DataFrame, use_last_completed_month: bool = True) -> int:
+    """
+    Returns eval index (negative) for evaluated month.
+    If current month is in progress and use_last_completed_month is True -> use -2 else -1
+    """
     now = pd.Timestamp(datetime.now(timezone.utc).date())
     last_idx = monthly.index[-1]
     in_progress = (last_idx.year == now.year) and (last_idx.month == now.month)
+    return (-2 if in_progress else -1) if use_last_completed_month else -1
 
-    eval_pos = (-2 if in_progress else -1) if use_last_completed_month else -1
+def monthly_flags(monthly: pd.DataFrame, use_last_completed_month: bool = True) -> dict:
+    if monthly is None or monthly.empty or len(monthly) < 3:
+        return {"ok": False}
+
+    eval_pos = pick_eval_month(monthly, use_last_completed_month)
     if len(monthly) < (abs(eval_pos) + 2):
         return {"ok": False}
 
     m = monthly.iloc[eval_pos]
     m_prev = monthly.iloc[eval_pos - 1]
 
-    month_2down = (m["Low"] < m_prev["Low"]) and (m["High"] <= m_prev["High"])
-    month_green = (m["Close"] > m["Open"])
+    m2d = (m["Low"] < m_prev["Low"]) and (m["High"] <= m_prev["High"])
+    m2u = (m["High"] > m_prev["High"]) and (m["Low"] >= m_prev["Low"])
+    mgreen = (m["Close"] > m["Open"])
     target = float(m["High"])
 
     return {
         "ok": True,
         "eval_month_start": monthly.index[eval_pos],
-        "month_2down": bool(month_2down),
-        "month_green": bool(month_green),
-        "target_prior_month_high": target,
+        "m2d": bool(m2d),
+        "m2u": bool(m2u),
+        "mgreen": bool(mgreen),
+        "target": target,
     }
 
-def strat_daily_flags(daily: pd.DataFrame) -> dict:
+def daily_bar_types(daily: pd.DataFrame) -> dict:
+    """
+    Latest daily bar classification:
+      2U: high > prev_high and low >= prev_low
+      2D: low < prev_low and high <= prev_high
+      1:  high < prev_high and low > prev_low
+      3:  high > prev_high and low < prev_low
+    """
     if daily is None or daily.empty or len(daily) < 3:
         return {"ok": False}
 
     d = daily.iloc[-1]
-    d_prev = daily.iloc[-2]
+    p = daily.iloc[-2]
 
-    failed2_down = (d["Low"] < d_prev["Low"]) and (d["High"] > d_prev["High"])
-    inside_day = (d["High"] < d_prev["High"]) and (d["Low"] > d_prev["Low"])
-    failed2_down_green = bool(failed2_down and (d["Close"] > d["Open"]))
+    high, low = float(d["High"]), float(d["Low"])
+    ph, pl = float(p["High"]), float(p["Low"])
+
+    is_2u = (high > ph) and (low >= pl)
+    is_2d = (low < pl) and (high <= ph)
+    is_1  = (high < ph) and (low > pl)
+    is_3  = (high > ph) and (low < pl)
+
+    # inside = 1-bar
+    inside = is_1
 
     return {
         "ok": True,
         "bar_date": daily.index[-1],
         "last_close": float(d["Close"]),
-        "failed2_down": bool(failed2_down),
-        "failed2_down_green": bool(failed2_down_green),
-        "inside_day": bool(inside_day),
+        "is_2u": bool(is_2u),
+        "is_2d": bool(is_2d),
+        "is_1": bool(is_1),
+        "is_3": bool(is_3),
+        "inside": bool(inside),
     }
 
-def monthly_hit_probability(daily: pd.DataFrame, years: int = 2) -> dict:
+def monthly_hit_probability_after_2d_green(daily: pd.DataFrame, years: int = 2) -> dict:
     """
     Empirical probability:
     After a 2-down green month, does price hit THAT month’s high during the following month?
@@ -296,147 +289,187 @@ def monthly_hit_probability(daily: pd.DataFrame, years: int = 2) -> dict:
     if d.empty or len(d) < 60:
         return {"setups": 0, "hit_rate": 0.0, "avg_days": None}
 
-    monthly = to_monthly_ohlc(d)
-    if len(monthly) < 3:
+    mdf = to_monthly_ohlc(d)
+    if len(mdf) < 3:
         return {"setups": 0, "hit_rate": 0.0, "avg_days": None}
 
     setups = 0
     hits = 0
     days_to_hit = []
 
-    for i in range(1, len(monthly) - 1):
-        m_prev = monthly.iloc[i - 1]
-        m = monthly.iloc[i]
+    for i in range(1, len(mdf) - 1):
+        prev = mdf.iloc[i - 1]
+        m = mdf.iloc[i]
 
-        month_2down = (m["Low"] < m_prev["Low"]) and (m["High"] <= m_prev["High"])
-        month_green = (m["Close"] > m["Open"])
-        if not (month_2down and month_green):
+        m2d = (m["Low"] < prev["Low"]) and (m["High"] <= prev["High"])
+        green = (m["Close"] > m["Open"])
+        if not (m2d and green):
             continue
 
         setups += 1
         target = float(m["High"])
 
-        next_month_start = monthly.index[i + 1]
-        next_month_end = next_month_start + pd.offsets.MonthEnd(1)
-
-        nm = d[(d.index >= next_month_start) & (d.index <= next_month_end)]
+        next_start = mdf.index[i + 1]
+        next_end = next_start + pd.offsets.MonthEnd(1)
+        nm = d[(d.index >= next_start) & (d.index <= next_end)]
         if nm.empty:
             continue
 
         hit_rows = nm[nm["High"] >= target]
         if not hit_rows.empty:
             hits += 1
-            first_hit = hit_rows.index[0]
-            start = nm.index[0]
-            days_to_hit.append((first_hit - start).days)
+            days_to_hit.append((hit_rows.index[0] - nm.index[0]).days)
 
     hit_rate = (hits / setups) if setups > 0 else 0.0
     avg_days = float(np.mean(days_to_hit)) if days_to_hit else None
-
     return {"setups": setups, "hit_rate": hit_rate, "avg_days": avg_days}
 
-def score_setup(month2down: bool, monthgreen: bool, failed2: bool, inside: bool, room_pct: float, hit_rate_pct: float) -> float:
+# -----------------------------
+# Scoring (scenario-specific)
+# -----------------------------
+def score_s1(m2d: bool, mgreen: bool, daily_2d: bool, inside: bool, room_pct: float, prob_pct: float) -> float:
+    """
+    Scenario 1 weights:
+      Monthly (0–45): 2D +25, Green +20
+      Daily (0–30): 2D +25, Inside +20
+      Room (0–15): 1 point per 1% room (cap 15, floor 0)
+      Prob (0–10): prob% mapped to 0–10
+    """
     score = 0.0
+    score += 25.0 if m2d else 0.0
+    score += 20.0 if mgreen else 0.0
 
-    # Monthly (0–40)
-    score += 20.0 if month2down else 0.0
-    score += 20.0 if monthgreen else 0.0
+    if daily_2d:
+        score += 25.0
+    elif inside:
+        score += 20.0
 
-    # Daily (0–30)
-    if failed2:
+    score += max(0.0, min(15.0, room_pct))
+    score += max(0.0, min(10.0, (prob_pct / 100.0) * 10.0))
+    return round(score, 1)
+
+def score_s2(m2u: bool, daily_2u: bool, inside: bool, room_pct: float, prob_pct: float) -> float:
+    """
+    Scenario 2 weights:
+      Monthly (0–40): 2U +40
+      Daily (0–35): 2U +30, Inside +20
+      Room (0–15): 1 point per 1% room (cap 15, floor 0)
+      Prob (0–10): prob% mapped to 0–10 (optional context strength)
+    """
+    score = 0.0
+    score += 40.0 if m2u else 0.0
+
+    if daily_2u:
         score += 30.0
     elif inside:
         score += 20.0
 
-    # Room (0–15) (cap at 15%)
     score += max(0.0, min(15.0, room_pct))
-
-    # Probability (0–15)
-    score += max(0.0, min(15.0, (hit_rate_pct / 100.0) * 15.0))
-
+    score += max(0.0, min(10.0, (prob_pct / 100.0) * 10.0))
     return round(score, 1)
 
-def tier_from_score(score: float) -> str:
-    if score >= 80:
-        return "A"
-    if score >= 65:
-        return "B"
-    if score >= 50:
-        return "C"
+def tier(score: float) -> str:
+    if score >= 80: return "A"
+    if score >= 65: return "B"
+    if score >= 50: return "C"
     return "D"
 
-def scan_one(
-    ticker: str,
-    daily: pd.DataFrame,
-    use_last_completed_month: bool,
-    require_failed2_green: bool,
-) -> dict:
+# -----------------------------
+# Scenario scanners
+# -----------------------------
+def scan_scenario_1(ticker: str, daily: pd.DataFrame, use_last_completed_month: bool) -> dict:
     if daily is None or daily.empty or len(daily) < 60:
-        return {"Ticker": ticker, "Score": 0.0, "Tier": "D", "Status": "No/insufficient data"}
+        return {"Ticker": ticker, "Score": 0.0, "Tier": "D", "Status": "No data"}
 
-    monthly = to_monthly_ohlc(daily)
-    m = strat_month_flags(monthly, use_last_completed_month=use_last_completed_month)
-    d = strat_daily_flags(daily)
+    mdf = to_monthly_ohlc(daily)
+    mf = monthly_flags(mdf, use_last_completed_month)
+    df = daily_bar_types(daily)
 
-    if not m.get("ok") or not d.get("ok"):
-        return {"Ticker": ticker, "Score": 0.0, "Tier": "D", "Status": "Insufficient candles"}
+    if not mf.get("ok") or not df.get("ok"):
+        return {"Ticker": ticker, "Score": 0.0, "Tier": "D", "Status": "Insufficient"}
 
-    # Monthly flags
-    month2down = m["month_2down"]
-    monthgreen = m["month_green"]
-    eval_month = m["eval_month_start"].strftime("%Y-%m")
-    target = m["target_prior_month_high"]
+    # Scenario 1 requirements
+    m2d = mf["m2d"]
+    mgreen = mf["mgreen"]
+    daily_2d = df["is_2d"]
+    inside = df["inside"]
 
-    # Daily flags
-    failed2 = d["failed2_down_green"] if require_failed2_green else d["failed2_down"]
-    inside = d["inside_day"]
-    last_bar = pd.to_datetime(d["bar_date"]).strftime("%Y-%m-%d")
-    last_close = d["last_close"]
-
-    trigger = "FAILED2D" if failed2 else ("INSIDE" if inside else "—")
-
-    # Room
+    target = mf["target"]
+    last_close = df["last_close"]
     room_pct = (target - last_close) / last_close * 100.0
 
-    # Probability (2y)
-    prob = monthly_hit_probability(daily, years=2)
-    hit_rate_pct = prob["hit_rate"] * 100.0
+    prob = monthly_hit_probability_after_2d_green(daily, years=2)
+    prob_pct = prob["hit_rate"] * 100.0
 
-    # Score + tier
-    score = score_setup(
-        month2down=month2down,
-        monthgreen=monthgreen,
-        failed2=failed2,
-        inside=inside,
-        room_pct=room_pct,
-        hit_rate_pct=hit_rate_pct,
-    )
-    tier = tier_from_score(score)
-
+    score = score_s1(m2d, mgreen, daily_2d, inside, room_pct, prob_pct)
     return {
         "Ticker": ticker,
         "Score": score,
-        "Tier": tier,
-        "Trigger": trigger,
-        "Monthly_2Down": ck(month2down),
-        "Monthly_Green": ck(monthgreen),
-        "Eval_Month": eval_month,
-        "Last_Bar": last_bar,
+        "Tier": tier(score),
+        "M_2D": ck(m2d),
+        "M_Green": ck(mgreen),
+        "Daily_2D": ck(daily_2d),
+        "Daily_Inside": ck(inside),
+        "Eval_Month": mf["eval_month_start"].strftime("%Y-%m"),
+        "Last_Bar": pd.to_datetime(df["bar_date"]).strftime("%Y-%m-%d"),
         "Last_Close": round(last_close, 2),
-        "Target_PriorMonthHigh": round(target, 2),
-        "Room_To_Target_%": round(room_pct, 2),
-        "Setup_Count_2Y": int(prob["setups"]),
-        "Hit_Rate_%_2Y": round(hit_rate_pct, 1),
-        "Avg_Days_To_Target_2Y": (round(prob["avg_days"], 1) if prob["avg_days"] is not None else None),
+        "Target_PrevMonthHigh": round(target, 2),
+        "Room_%": round(room_pct, 2),
+        "Prob_Hit_%_2Y": round(prob_pct, 1),
+        "Setups_2Y": int(prob["setups"]),
+        "AvgDays_2Y": (round(prob["avg_days"], 1) if prob["avg_days"] is not None else None),
+        "Status": "OK",
+    }
+
+def scan_scenario_2(ticker: str, daily: pd.DataFrame, use_last_completed_month: bool) -> dict:
+    if daily is None or daily.empty or len(daily) < 60:
+        return {"Ticker": ticker, "Score": 0.0, "Tier": "D", "Status": "No data"}
+
+    mdf = to_monthly_ohlc(daily)
+    mf = monthly_flags(mdf, use_last_completed_month)
+    df = daily_bar_types(daily)
+
+    if not mf.get("ok") or not df.get("ok"):
+        return {"Ticker": ticker, "Score": 0.0, "Tier": "D", "Status": "Insufficient"}
+
+    # Scenario 2 requirements
+    m2u = mf["m2u"]
+    daily_2u = df["is_2u"]
+    inside = df["inside"]
+
+    target = mf["target"]
+    last_close = df["last_close"]
+    room_pct = (target - last_close) / last_close * 100.0
+
+    # Keep same probability metric as a context bonus (optional but consistent)
+    prob = monthly_hit_probability_after_2d_green(daily, years=2)
+    prob_pct = prob["hit_rate"] * 100.0
+
+    score = score_s2(m2u, daily_2u, inside, room_pct, prob_pct)
+    return {
+        "Ticker": ticker,
+        "Score": score,
+        "Tier": tier(score),
+        "M_2U": ck(m2u),
+        "Daily_2U": ck(daily_2u),
+        "Daily_Inside": ck(inside),
+        "Eval_Month": mf["eval_month_start"].strftime("%Y-%m"),
+        "Last_Bar": pd.to_datetime(df["bar_date"]).strftime("%Y-%m-%d"),
+        "Last_Close": round(last_close, 2),
+        "Target_PrevMonthHigh": round(target, 2),
+        "Room_%": round(room_pct, 2),
+        "Prob_Hit_%_2Y": round(prob_pct, 1),
+        "Setups_2Y": int(prob["setups"]),
+        "AvgDays_2Y": (round(prob["avg_days"], 1) if prob["avg_days"] is not None else None),
         "Status": "OK",
     }
 
 # -----------------------------
 # UI
 # -----------------------------
-st.title("2D Scan (STRAT) — v1.1 (Ranked)")
+st.title("2D Scan (STRAT) — v1.2")
 st.markdown(
-    '<div class="muted">Monthly: <b>2-Down + Green</b> • Daily: <b>Failed2D or Inside</b> • Target: <b>prior month high</b> • Probability: <b>2-year hit rate</b> • Output: <b>Score 0–100</b></div>',
+    '<div class="muted">Two swing scenarios: (1) <b>M 2D+Green → D 2D/Inside</b> • (2) <b>M 2U → D 2U/Inside</b> • Output: <b>Ranked 0–100</b></div>',
     unsafe_allow_html=True,
 )
 
@@ -451,39 +484,36 @@ with st.sidebar:
         ],
         index=0,
     )
-
     period = st.selectbox("History period (download)", ["6mo", "1y", "2y", "5y"], index=2)
 
-    st.header("Signal Rules")
+    st.header("Monthly Handling")
     use_last_completed_month = st.checkbox("Use last COMPLETED month (stable)", value=True)
-    require_failed2_green = st.checkbox("Require Failed 2 Down to close green", value=False)
 
-    st.header("Ranking Filters")
+    st.header("Ranking Filter")
     min_score = st.slider("Minimum Score", 0, 100, 60)
 
     run = st.button("Run Scan", type="primary")
 
-# Build tickers
+# Universe
 tickers: list[str] = []
-universe_note = None
+note = None
 
 try:
     if universe == "Fallback Top 50 (manual)":
         tickers = DEFAULT_TOP50
-        universe_note = "Using manual fallback Top 50."
+        note = "Using manual fallback Top 50."
 
     elif universe.startswith("Top 50"):
         sp = get_sp500_tickers()
         ndx = get_nasdaq100_tickers()
         combined = sorted(set(sp + ndx))
         top50_df = get_top50_by_marketcap(combined)
-
         if top50_df is None or top50_df.empty:
             tickers = DEFAULT_TOP50
-            universe_note = "Top 50 market-cap fetch returned empty; using fallback Top 50."
+            note = "Top 50 market-cap fetch empty; using fallback Top 50."
         else:
             tickers = top50_df["Ticker"].tolist()
-            universe_note = "Using Top 50 mega caps (by market cap)."
+            note = "Using Top 50 mega caps (by market cap)."
 
     else:
         tickers_text = st.text_area(
@@ -492,29 +522,30 @@ try:
             height=120,
         )
         tickers = [t.strip().upper() for t in tickers_text.replace("\n", ",").split(",") if t.strip()]
-        universe_note = f"Using custom list ({len(tickers)} tickers)."
+        note = f"Using custom list ({len(tickers)} tickers)."
 
 except Exception as e:
     tickers = DEFAULT_TOP50
-    universe_note = f"Universe fetch failed ({e}). Using fallback Top 50."
+    note = f"Universe fetch failed ({e}). Using fallback Top 50."
 
-if universe_note:
-    st.info(universe_note)
+if note:
+    st.info(note)
 
 if not run:
-    st.write("Click **Run Scan** to generate ranked results.")
+    st.write("Click **Run Scan** to generate results.")
     st.stop()
 
 if not tickers:
     st.warning("No tickers loaded.")
     st.stop()
 
-# Download daily data (batch)
+# Download
 st.info(f"Downloading daily data (batch) for {len(tickers)} tickers…")
 batch = fetch_batch_daily(tickers, period=period)
 
-# Scan loop
-results = []
+# Scan both scenarios
+res1 = []
+res2 = []
 progress = st.progress(0)
 
 for i, t in enumerate(tickers, start=1):
@@ -522,29 +553,38 @@ for i, t in enumerate(tickers, start=1):
     if df is None or df.empty:
         df = fetch_single_daily(t, period=period)
 
-    results.append(
-        scan_one(
-            ticker=t,
-            daily=df,
-            use_last_completed_month=use_last_completed_month,
-            require_failed2_green=require_failed2_green,
-        )
-    )
+    res1.append(scan_scenario_1(t, df, use_last_completed_month))
+    res2.append(scan_scenario_2(t, df, use_last_completed_month))
+
     progress.progress(i / max(len(tickers), 1))
 
-res = pd.DataFrame(results)
+df1 = pd.DataFrame(res1)
+df2 = pd.DataFrame(res2)
 
 # Filter + sort
-if not res.empty:
-    res = res[res["Score"] >= float(min_score)].copy()
-    res = res.sort_values(["Score", "Room_To_Target_%"], ascending=[False, False]).reset_index(drop=True)
+if not df1.empty:
+    df1 = df1[df1["Score"] >= float(min_score)].copy()
+    df1 = df1.sort_values(["Score", "Room_%"], ascending=[False, False]).reset_index(drop=True)
 
-st.subheader("Ranked Results")
-st.dataframe(res, use_container_width=True, hide_index=True)
+if not df2.empty:
+    df2 = df2[df2["Score"] >= float(min_score)].copy()
+    df2 = df2.sort_values(["Score", "Room_%"], ascending=[False, False]).reset_index(drop=True)
 
-st.write(f"Shown: **{len(res)}** / {len(results)} (min score = {min_score})")
-
-st.caption(
-    "✅ = condition met. Score is a weighted ranking (Monthly + Daily trigger + Room + 2Y hit rate). "
-    "This is an opportunity list, not a binary match filter."
+tab1, tab2 = st.tabs(
+    [
+        "Scenario 1: M 2D+Green → D 2D/Inside (toward prev month high)",
+        "Scenario 2: M 2U → D 2U/Inside (continuation up)",
+    ]
 )
+
+with tab1:
+    st.subheader("Scenario 1 — Ranked Results")
+    st.dataframe(df1, use_container_width=True, hide_index=True)
+    st.write(f"Shown: **{len(df1)}** / {len(res1)} (min score = {min_score})")
+    st.caption("✅ indicates a condition is met. Daily signals are latest-day only. Target is evaluated month high (prior month high).")
+
+with tab2:
+    st.subheader("Scenario 2 — Ranked Results")
+    st.dataframe(df2, use_container_width=True, hide_index=True)
+    st.write(f"Shown: **{len(df2)}** / {len(res2)} (min score = {min_score})")
+    st.caption("✅ indicates a condition is met. Daily signals are latest-day only. Target is evaluated month high (prior month high).")
