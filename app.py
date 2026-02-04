@@ -1,19 +1,57 @@
 # app.py
-# STRAT Dashboard Scanner
-# Thesis: Monthly 2-Down (green) context + Daily entry trigger (Failed 2 Down OR Inside Day)
-# Universe: Top 50 mega caps (from S&P 500 + Nasdaq-100), or other universe options
+# STRAT Dashboard Scanner (Streamlit)
+# Thesis:
+#   Monthly context = 2-Down month that closes green
+#   Daily entry = Failed 2 Down OR Inside Day
+#   Target = prior (evaluated) month high
 #
-# Run:
-#   pip install streamlit yfinance pandas numpy lxml html5lib
+# Universe:
+#   - Top 50 Mega Caps (auto) OR S&P 500 OR Nasdaq-100 OR Custom
+#
+# Notes:
+#   - Uses Wikipedia for constituents; Streamlit Cloud can 403 without a User-Agent.
+#   - This version fetches HTML via requests w/ User-Agent to avoid 403.
+#   - Includes a DEFAULT_TOP50 fallback if universe fetch fails.
+#
+# Run locally:
+#   pip install -r requirements.txt
 #   streamlit run app.py
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import requests
+from io import StringIO
 from datetime import datetime, timezone
 
 st.set_page_config(page_title="STRAT Scanner Dashboard", layout="wide")
+
+# -----------------------------
+# Fallback universe (keeps app running even if Wikipedia blocks)
+# -----------------------------
+DEFAULT_TOP50 = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","GOOG","META","BRK-B","LLY","AVGO",
+    "TSLA","JPM","V","UNH","XOM","WMT","JNJ","MA","PG","COST",
+    "HD","ABBV","MRK","ORCL","CVX","KO","BAC","NFLX","CRM","TMO",
+    "PEP","LIN","WFC","ACN","MCD","CSCO","QCOM","TXN","INTU","DIS",
+    "ABT","IBM","GE","AMD","CAT","AMGN","ADBE","NOW","PM","GS"
+]
+
+# -----------------------------
+# Wikipedia HTML fetch (avoids 403 on cloud IPs)
+# -----------------------------
+def _fetch_html(url: str) -> str:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        )
+    }
+    r = requests.get(url, headers=headers, timeout=25)
+    r.raise_for_status()
+    return r.text
 
 # -----------------------------
 # Universe builders
@@ -21,38 +59,31 @@ st.set_page_config(page_title="STRAT Scanner Dashboard", layout="wide")
 @st.cache_data(ttl=60 * 60 * 24)
 def get_sp500_tickers() -> list[str]:
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
+    html = _fetch_html(url)
+    tables = pd.read_html(StringIO(html))
     df = tables[0]
     tickers = df["Symbol"].astype(str).str.strip().tolist()
-    # Yahoo uses "-" for class shares
+    # Yahoo uses "-" instead of "." for class shares (BRK.B -> BRK-B)
     tickers = [t.replace(".", "-") for t in tickers]
     return sorted(set(tickers))
-
 
 @st.cache_data(ttl=60 * 60 * 24)
 def get_nasdaq100_tickers() -> list[str]:
     url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-    tables = pd.read_html(url)
+    html = _fetch_html(url)
+    tables = pd.read_html(StringIO(html))
 
     best = None
     for t in tables:
+        if isinstance(t.columns, pd.MultiIndex):
+            t.columns = [" ".join(map(str, c)).strip() for c in t.columns]
         cols = [str(c).lower() for c in t.columns]
         if any("ticker" in c for c in cols) or any("symbol" in c for c in cols):
             best = t
             break
-        # some tables have multiindex columns; handle that too
-        if isinstance(t.columns, pd.MultiIndex):
-            flat_cols = [" ".join(map(str, c)).lower() for c in t.columns]
-            if any("ticker" in c for c in flat_cols) or any("symbol" in c for c in flat_cols):
-                best = t
-                break
 
     if best is None:
         raise ValueError("Could not find Nasdaq-100 constituents table.")
-
-    # flatten columns if needed
-    if isinstance(best.columns, pd.MultiIndex):
-        best.columns = [" ".join(map(str, c)).strip() for c in best.columns]
 
     ticker_col = None
     for c in best.columns:
@@ -61,12 +92,11 @@ def get_nasdaq100_tickers() -> list[str]:
             ticker_col = c
             break
     if ticker_col is None:
-        raise ValueError("Could not locate a ticker/symbol column on Nasdaq-100 table.")
+        raise ValueError("Could not locate a ticker/symbol column.")
 
     tickers = best[ticker_col].astype(str).str.strip().tolist()
     tickers = [t.replace(".", "-") for t in tickers]
     return sorted(set(tickers))
-
 
 @st.cache_data(ttl=60 * 60 * 12)
 def get_top50_by_marketcap(tickers: list[str]) -> pd.DataFrame:
@@ -76,15 +106,11 @@ def get_top50_by_marketcap(tickers: list[str]) -> pd.DataFrame:
             tk = yf.Ticker(t)
             fi = getattr(tk, "fast_info", {}) or {}
             mcap = fi.get("marketCap", None)
-
             if mcap is None:
-                # fallback (slower)
                 info = tk.info or {}
                 mcap = info.get("marketCap", None)
-
             if mcap is None:
                 continue
-
             rows.append({"Ticker": t, "MarketCap": float(mcap)})
         except Exception:
             continue
@@ -93,16 +119,11 @@ def get_top50_by_marketcap(tickers: list[str]) -> pd.DataFrame:
     df = df.sort_values("MarketCap", ascending=False).head(50).reset_index(drop=True)
     return df
 
-
 # -----------------------------
-# Data fetch (batch)
+# Batch data fetch
 # -----------------------------
 @st.cache_data(ttl=60 * 15)
 def fetch_batch_daily(tickers: list[str], period: str = "2y") -> dict[str, pd.DataFrame]:
-    """
-    Batch download daily OHLCV for many tickers.
-    Returns dict[ticker] = DataFrame(Open,High,Low,Close,Volume) with DatetimeIndex.
-    """
     if not tickers:
         return {}
 
@@ -124,15 +145,14 @@ def fetch_batch_daily(tickers: list[str], period: str = "2y") -> dict[str, pd.Da
             if t in data.columns.get_level_values(0):
                 df = data[t].copy().dropna()
                 df = df.rename(columns=str.title)
-                # yfinance sometimes returns "Adj Close"; ignore it
                 keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
                 df = df[keep].dropna()
                 df.index = pd.to_datetime(df.index)
                 df = df.sort_index()
-                if len(df) > 5:
+                if len(df) > 10:
                     out[t] = df
     else:
-        # single ticker case
+        # Single ticker case
         df = data.copy().dropna()
         df = df.rename(columns=str.title)
         keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
@@ -143,18 +163,12 @@ def fetch_batch_daily(tickers: list[str], period: str = "2y") -> dict[str, pd.Da
 
     return out
 
-
 # -----------------------------
 # STRAT logic
 # -----------------------------
 def to_monthly_ohlc(daily: pd.DataFrame) -> pd.DataFrame:
-    """
-    Convert daily OHLCV to monthly OHLCV (calendar month).
-    Uses month-start index (MS).
-    """
     d = daily.copy()
-    if not isinstance(d.index, pd.DatetimeIndex):
-        d.index = pd.to_datetime(d.index)
+    d.index = pd.to_datetime(d.index)
     d = d.sort_index()
 
     monthly = pd.DataFrame(
@@ -169,13 +183,12 @@ def to_monthly_ohlc(daily: pd.DataFrame) -> pd.DataFrame:
 
     return monthly
 
-
 def strat_month_2down_green(monthly: pd.DataFrame, use_last_completed_month: bool = True) -> dict:
     """
     Monthly condition:
       2 Down: low < low[1] AND high <= high[1]
       Green: close > open
-    Target = evaluated month HIGH (the month you're using as "prior month high")
+    Target: evaluated month high
     """
     if monthly is None or monthly.empty or len(monthly) < 3:
         return {"ok": False}
@@ -189,7 +202,6 @@ def strat_month_2down_green(monthly: pd.DataFrame, use_last_completed_month: boo
     else:
         eval_pos = -1
 
-    # need eval and prior month
     if len(monthly) < (abs(eval_pos) + 2):
         return {"ok": False}
 
@@ -207,15 +219,12 @@ def strat_month_2down_green(monthly: pd.DataFrame, use_last_completed_month: boo
         "month_green": bool(month_green),
         "eval_month_start": monthly.index[eval_pos],
         "target_prior_month_high": float(m["High"]),
-        "eval_month_open": float(m["Open"]),
-        "eval_month_close": float(m["Close"]),
     }
-
 
 def strat_daily_triggers(daily: pd.DataFrame) -> dict:
     """
-    Daily triggers on the latest daily bar in the dataset:
-      Failed 2 Down: low < low[1] AND high > high[1]  (often a 3 bar)
+    Daily triggers on the latest bar:
+      Failed 2 Down: low < low[1] AND high > high[1]
       Inside Day: high < high[1] AND low > low[1]
     """
     if daily is None or daily.empty or len(daily) < 3:
@@ -232,16 +241,10 @@ def strat_daily_triggers(daily: pd.DataFrame) -> dict:
         "ok": True,
         "bar_date": daily.index[-1],
         "last_close": float(d["Close"]),
-        "last_open": float(d["Open"]),
         "failed2_down": bool(failed2_down),
         "failed2_down_green": bool(failed2_down_green),
         "inside_day": bool(inside_day),
-        "prev_high": float(d_prev["High"]),
-        "prev_low": float(d_prev["Low"]),
-        "today_high": float(d["High"]),
-        "today_low": float(d["Low"]),
     }
-
 
 def scan_one(
     ticker: str,
@@ -292,7 +295,6 @@ def scan_one(
         "Status": "OK" if match else "No match",
     }
 
-
 # -----------------------------
 # UI
 # -----------------------------
@@ -301,35 +303,44 @@ st.caption("Monthly context: **2-Down month that closes green** • Daily entry:
 
 with st.sidebar:
     st.header("Universe")
-
     universe = st.selectbox(
         "Select universe",
-        ["Top 50 (Mega Caps: S&P500 + Nasdaq-100)", "S&P 500", "Nasdaq-100", "Custom (paste)"],
+        [
+            "Top 50 (Mega Caps: S&P500 + Nasdaq-100)",
+            "S&P 500",
+            "Nasdaq-100",
+            "Custom (paste)",
+            "Fallback Top 50 (manual)",
+        ],
         index=0,
     )
 
-    period = st.selectbox("History period (yfinance)", ["6mo", "1y", "2y", "5y"], index=2)
+    period = st.selectbox("History period", ["6mo", "1y", "2y", "5y"], index=2)
 
     st.header("Rules")
     use_last_completed_month = st.checkbox("Use last COMPLETED month (stable)", value=True)
     require_failed2_green = st.checkbox("Require Failed 2 Down to close green", value=False)
     min_room_pct = st.number_input("Min room to prior month high (%)", value=0.0, step=0.5)
 
-    show_top50_table = st.checkbox("Show Top 50 list table", value=False)
+    show_universe_table = st.checkbox("Show universe table (if available)", value=False)
 
     run = st.button("Run Scan", type="primary")
 
-# Build tickers universe
 tickers: list[str] = []
-top50_df = None
+universe_table = None
+universe_warning = None
 
+# Build universe
 try:
-    if universe.startswith("Top 50"):
+    if universe == "Fallback Top 50 (manual)":
+        tickers = DEFAULT_TOP50
+
+    elif universe.startswith("Top 50"):
         sp = get_sp500_tickers()
         ndx = get_nasdaq100_tickers()
         combined = sorted(set(sp + ndx))
-        top50_df = get_top50_by_marketcap(combined)
-        tickers = top50_df["Ticker"].tolist()
+        universe_table = get_top50_by_marketcap(combined)
+        tickers = universe_table["Ticker"].tolist()
 
     elif universe == "S&P 500":
         tickers = get_sp500_tickers()
@@ -344,99 +355,101 @@ try:
             height=120,
         )
         tickers = [t.strip().upper() for t in tickers_text.replace("\n", ",").split(",") if t.strip()]
+
 except Exception as e:
-    st.error(f"Universe load error: {e}")
-    tickers = []
+    universe_warning = f"Universe load failed ({e}). Using fallback Top 50."
+    tickers = DEFAULT_TOP50
 
-if universe.startswith("Top 50") and top50_df is not None and show_top50_table:
-    st.subheader("Top 50 Mega Caps (by market cap)")
-    st.dataframe(top50_df, use_container_width=True, hide_index=True)
+if universe_warning:
+    st.warning(universe_warning)
 
-if run:
-    if not tickers:
-        st.warning("No tickers loaded.")
-        st.stop()
+if show_universe_table and universe_table is not None:
+    st.subheader("Universe (Top 50 Mega Caps by market cap)")
+    st.dataframe(universe_table, use_container_width=True, hide_index=True)
 
-    st.info(f"Downloading data for {len(tickers)} tickers… (batch)")
-    batch = fetch_batch_daily(tickers, period=period)
-
-    results = []
-    progress = st.progress(0)
-    for i, t in enumerate(tickers, start=1):
-        df = batch.get(t, pd.DataFrame())
-        results.append(
-            scan_one(
-                ticker=t,
-                daily=df,
-                use_last_completed_month=use_last_completed_month,
-                require_failed2_green=require_failed2_green,
-                min_room_pct=float(min_room_pct),
-            )
-        )
-        progress.progress(i / max(len(tickers), 1))
-
-    res = pd.DataFrame(results)
-
-    # Sort: matches first, then biggest room to target
-    if "Room_To_Target_%" in res.columns:
-        res = res.sort_values(["Match", "Room_To_Target_%"], ascending=[False, False]).reset_index(drop=True)
-
-    st.subheader("Scan Results")
-    st.dataframe(res, use_container_width=True, hide_index=True)
-
-    matches = res[res["Match"] == True]
-    st.write(f"Matches: **{len(matches)}** / {len(res)}")
-
-    st.divider()
-    st.subheader("Chart Viewer")
-
-    pick = st.selectbox("Select ticker", res["Ticker"].tolist(), index=0)
-    ddf = batch.get(pick, pd.DataFrame())
-
-    if ddf is None or ddf.empty:
-        st.warning("No chart data for that ticker.")
-        st.stop()
-
-    # show close chart
-    st.line_chart(ddf["Close"])
-
-    # compute & show key levels and trigger details
-    mm = to_monthly_ohlc(ddf)
-    m_info = strat_month_2down_green(mm, use_last_completed_month=use_last_completed_month)
-    d_info = strat_daily_triggers(ddf)
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.markdown("**Monthly Context**")
-        if m_info.get("ok"):
-            st.write(f"Evaluated Month: **{m_info['eval_month_start'].strftime('%Y-%m')}**")
-            st.write(f"2 Down: **{m_info['month_2down']}**")
-            st.write(f"Green: **{m_info['month_green']}**")
-        else:
-            st.write("Monthly: insufficient data")
-
-    with col2:
-        st.markdown("**Daily Trigger (latest bar)**")
-        if d_info.get("ok"):
-            st.write(f"Date: **{pd.to_datetime(d_info['bar_date']).strftime('%Y-%m-%d')}**")
-            st.write(f"Failed 2 Down: **{d_info['failed2_down']}**")
-            st.write(f"Failed 2 Down (green close): **{d_info['failed2_down_green']}**")
-            st.write(f"Inside Day: **{d_info['inside_day']}**")
-        else:
-            st.write("Daily: insufficient data")
-
-    with col3:
-        st.markdown("**Target & Room**")
-        if m_info.get("ok") and d_info.get("ok"):
-            target = m_info["target_prior_month_high"]
-            last_close = d_info["last_close"]
-            room_pct = (target - last_close) / last_close * 100.0
-            st.write(f"Prior Month High (target): **{target:.2f}**")
-            st.write(f"Last Close: **{last_close:.2f}**")
-            st.write(f"Room to target: **{room_pct:.2f}%**")
-        else:
-            st.write("Target: unavailable")
-
-else:
+if not run:
     st.write("Set your universe + rules, then click **Run Scan**.")
+    st.stop()
+
+if not tickers:
+    st.warning("No tickers loaded.")
+    st.stop()
+
+st.info(f"Downloading daily data (batch) for {len(tickers)} tickers…")
+batch = fetch_batch_daily(tickers, period=period)
+
+results = []
+progress = st.progress(0)
+
+for i, t in enumerate(tickers, start=1):
+    df = batch.get(t, pd.DataFrame())
+    results.append(
+        scan_one(
+            ticker=t,
+            daily=df,
+            use_last_completed_month=use_last_completed_month,
+            require_failed2_green=require_failed2_green,
+            min_room_pct=float(min_room_pct),
+        )
+    )
+    progress.progress(i / max(len(tickers), 1))
+
+res = pd.DataFrame(results)
+
+if "Room_To_Target_%" in res.columns:
+    res = res.sort_values(["Match", "Room_To_Target_%"], ascending=[False, False]).reset_index(drop=True)
+
+st.subheader("Scan Results")
+st.dataframe(res, use_container_width=True, hide_index=True)
+
+matches = res[res["Match"] == True]
+st.write(f"Matches: **{len(matches)}** / {len(res)}")
+
+st.divider()
+st.subheader("Chart Viewer")
+
+pick = st.selectbox("Select ticker", res["Ticker"].tolist(), index=0)
+ddf = batch.get(pick, pd.DataFrame())
+
+if ddf is None or ddf.empty:
+    st.warning("No chart data for that ticker.")
+    st.stop()
+
+st.line_chart(ddf["Close"])
+
+mm = to_monthly_ohlc(ddf)
+m_info = strat_month_2down_green(mm, use_last_completed_month=use_last_completed_month)
+d_info = strat_daily_triggers(ddf)
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    st.markdown("**Monthly Context**")
+    if m_info.get("ok"):
+        st.write(f"Evaluated Month: **{m_info['eval_month_start'].strftime('%Y-%m')}**")
+        st.write(f"2 Down: **{m_info['month_2down']}**")
+        st.write(f"Green: **{m_info['month_green']}**")
+    else:
+        st.write("Monthly: insufficient data")
+
+with col2:
+    st.markdown("**Daily Trigger (latest bar)**")
+    if d_info.get("ok"):
+        st.write(f"Date: **{pd.to_datetime(d_info['bar_date']).strftime('%Y-%m-%d')}**")
+        st.write(f"Failed 2 Down: **{d_info['failed2_down']}**")
+        st.write(f"Failed 2 Down (green close): **{d_info['failed2_down_green']}**")
+        st.write(f"Inside Day: **{d_info['inside_day']}**")
+    else:
+        st.write("Daily: insufficient data")
+
+with col3:
+    st.markdown("**Target & Room**")
+    if m_info.get("ok") and d_info.get("ok"):
+        target = m_info["target_prior_month_high"]
+        last_close = d_info["last_close"]
+        room_pct = (target - last_close) / last_close * 100.0
+        st.write(f"Prior Month High (target): **{target:.2f}**")
+        st.write(f"Last Close: **{last_close:.2f}**")
+        st.write(f"Room to target: **{room_pct:.2f}%**")
+    else:
+        st.write("Target: unavailable")
