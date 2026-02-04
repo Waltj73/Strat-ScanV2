@@ -4,3 +4,4 @@ pandas
 numpy
 lxml
 html5lib
+requests
