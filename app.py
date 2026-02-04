@@ -1,5 +1,5 @@
-# app.py (v1.3.1)
-# STRAT Scanner — Two Scenarios + Weekly Display + Correct STRAT Type Derivation
+# app.py (v1.3.2)
+# STRAT Scanner — Two Scenarios + Weekly + Monthly Completed vs Current Month Types (Fix)
 
 import streamlit as st
 import pandas as pd
@@ -9,7 +9,7 @@ import requests
 from io import StringIO
 from datetime import datetime, timezone
 
-st.set_page_config(page_title="2D Scan (STRAT) v1.3.1", layout="wide")
+st.set_page_config(page_title="2D Scan (STRAT) v1.3.2", layout="wide")
 
 CHECK = "✅"
 XMARK = "—"
@@ -205,34 +205,65 @@ def strat_type_latest(df: pd.DataFrame) -> str:
     prev = df.iloc[-2]
     return bar_type(float(cur["High"]), float(cur["Low"]), float(prev["High"]), float(prev["Low"]))
 
-def pick_eval_month_pos(monthly: pd.DataFrame, use_last_completed_month: bool = True) -> int:
+def strat_type_at_pos(df: pd.DataFrame, pos: int) -> str:
+    # pos refers to df.iloc[pos] vs df.iloc[pos-1]
+    if df is None or df.empty or len(df) < 2:
+        return XMARK
+    if pos == 0 or abs(pos) > len(df) - 1:
+        return XMARK
+    cur = df.iloc[pos]
+    prev = df.iloc[pos - 1]
+    return bar_type(float(cur["High"]), float(cur["Low"]), float(prev["High"]), float(prev["Low"]))
+
+def is_current_month_in_progress(monthly: pd.DataFrame) -> bool:
+    if monthly is None or monthly.empty:
+        return False
     now = pd.Timestamp(datetime.now(timezone.utc).date())
     last_idx = monthly.index[-1]
-    in_progress = (last_idx.year == now.year) and (last_idx.month == now.month)
-    return (-2 if in_progress else -1) if use_last_completed_month else -1
+    return (last_idx.year == now.year) and (last_idx.month == now.month)
 
-def monthly_eval_block(monthly: pd.DataFrame, use_last_completed_month: bool) -> dict:
+def monthly_context(monthly: pd.DataFrame) -> dict:
+    """
+    Returns:
+      - Completed month type (last fully closed month)
+      - Current month type (in-progress month) if available
+      - Completed month start date & target high
+      - Completed month green flag
+    """
     if monthly is None or monthly.empty or len(monthly) < 3:
         return {"ok": False}
 
-    pos = pick_eval_month_pos(monthly, use_last_completed_month)
-    if len(monthly) < (abs(pos) + 2):
+    in_progress = is_current_month_in_progress(monthly)
+
+    # Completed month index:
+    comp_pos = -2 if in_progress else -1
+    if len(monthly) < abs(comp_pos) + 2:
         return {"ok": False}
 
-    eval_df = monthly.iloc[:pos+1] if pos != -1 else monthly
-    # Get the evaluated month candle (pos) and its previous (pos-1)
-    m = monthly.iloc[pos]
-    mp = monthly.iloc[pos-1]
+    comp = monthly.iloc[comp_pos]
+    comp_prev = monthly.iloc[comp_pos - 1]
+    completed_type = bar_type(float(comp["High"]), float(comp["Low"]), float(comp_prev["High"]), float(comp_prev["Low"]))
+    completed_green = float(comp["Close"]) > float(comp["Open"])
+    completed_start = monthly.index[comp_pos]
+    target = float(comp["High"])
 
-    m_type = bar_type(float(m["High"]), float(m["Low"]), float(mp["High"]), float(mp["Low"]))
-    m_green = float(m["Close"]) > float(m["Open"])
-    target = float(m["High"])
+    current_type = XMARK
+    current_start = None
+    if in_progress and len(monthly) >= 2:
+        # Current month is last row (partial) compared to completed month
+        cur_pos = -1
+        cur = monthly.iloc[cur_pos]
+        prev = monthly.iloc[cur_pos - 1]
+        current_type = bar_type(float(cur["High"]), float(cur["Low"]), float(prev["High"]), float(prev["Low"]))
+        current_start = monthly.index[cur_pos]
 
     return {
         "ok": True,
-        "eval_month_start": monthly.index[pos],
-        "monthly_type": m_type,
-        "monthly_green": bool(m_green),
+        "completed_month_start": completed_start,
+        "completed_month_type": completed_type,
+        "completed_month_green": bool(completed_green),
+        "current_month_start": current_start,
+        "current_month_type": current_type,
         "target": target,
     }
 
@@ -300,7 +331,7 @@ def monthly_hit_probability_after_2d_green(daily: pd.DataFrame, years: int = 2) 
     return {"setups": setups, "hit_rate": hit_rate, "avg_days": avg_days}
 
 # -----------------------------
-# Scoring (kept simple)
+# Scoring
 # -----------------------------
 def tier(score: float) -> str:
     if score >= 80: return "A"
@@ -315,7 +346,6 @@ def score_prob(prob_pct: float) -> float:
     return max(0.0, min(10.0, (prob_pct / 100.0) * 10.0))
 
 def score_s1(month_ok: bool, daily_actionable: bool, room_pct: float, prob_pct: float) -> float:
-    # Monthly (45) + Daily (30) + Room (15) + Prob (10) = 100
     s = 0.0
     s += 45.0 if month_ok else 0.0
     s += 30.0 if daily_actionable else 0.0
@@ -324,7 +354,6 @@ def score_s1(month_ok: bool, daily_actionable: bool, room_pct: float, prob_pct: 
     return round(s, 1)
 
 def score_s2(month_ok: bool, daily_actionable: bool, room_pct: float, prob_pct: float) -> float:
-    # Monthly (40) + Daily (35) + Room (15) + Prob (10) = 100
     s = 0.0
     s += 40.0 if month_ok else 0.0
     s += 35.0 if daily_actionable else 0.0
@@ -333,34 +362,32 @@ def score_s2(month_ok: bool, daily_actionable: bool, room_pct: float, prob_pct: 
     return round(s, 1)
 
 # -----------------------------
-# Scenario scan functions
+# Scenarios
 # -----------------------------
-def scan_scenario_1(ticker: str, daily: pd.DataFrame, use_last_completed_month: bool) -> dict:
+def scan_scenario_1(ticker: str, daily: pd.DataFrame) -> dict:
     if daily is None or daily.empty or len(daily) < 60:
         return {"Ticker": ticker, "Score": 0.0, "Tier": "D", "Status": "No data"}
 
     mdf = to_monthly_ohlc(daily)
     wdf = to_weekly_ohlc(daily)
 
-    m = monthly_eval_block(mdf, use_last_completed_month)
-    d = daily_latest_block(daily)
+    mc = monthly_context(mdf)
+    dl = daily_latest_block(daily)
 
-    if not m.get("ok") or not d.get("ok"):
+    if not mc.get("ok") or not dl.get("ok"):
         return {"Ticker": ticker, "Score": 0.0, "Tier": "D", "Status": "Insufficient"}
 
     weekly_type = strat_type_latest(wdf)
 
-    monthly_type = m["monthly_type"]
-    monthly_green = m["monthly_green"]
+    # Scenario 1 uses COMPLETED month context
+    completed_type = mc["completed_month_type"]
+    completed_green = mc["completed_month_green"]
+    month_ok = (completed_type == "2D") and completed_green
 
-    # Scenario 1 monthly condition: 2D + green
-    month_ok = (monthly_type == "2D") and monthly_green
+    daily_actionable = dl["is_2d"] or dl["is_inside"]
 
-    # Scenario 1 daily actionable: daily 2D OR inside(1)
-    daily_actionable = d["is_2d"] or d["is_inside"]
-
-    target = m["target"]
-    last_close = d["last_close"]
+    target = mc["target"]
+    last_close = dl["last_close"]
     room_pct = (target - last_close) / last_close * 100.0
 
     prob = monthly_hit_probability_after_2d_green(daily, years=2)
@@ -373,12 +400,14 @@ def scan_scenario_1(ticker: str, daily: pd.DataFrame, use_last_completed_month: 
         "Score": score,
         "Tier": tier(score),
         "Weekly": weekly_type,
-        "Monthly_Type": monthly_type,
-        "Monthly_Green": ck(monthly_green),
+        "Completed_Month": mc["completed_month_start"].strftime("%Y-%m"),
+        "Completed_Month_Type": completed_type,
+        "Completed_Month_Green": ck(completed_green),
+        "Current_Month": (mc["current_month_start"].strftime("%Y-%m") if mc["current_month_start"] is not None else XMARK),
+        "Current_Month_Type": mc["current_month_type"],
         "Actionable_Daily": ck(daily_actionable),
-        "Daily_Type": d["daily_type"],
-        "Eval_Month": m["eval_month_start"].strftime("%Y-%m"),
-        "Last_Bar": pd.to_datetime(d["bar_date"]).strftime("%Y-%m-%d"),
+        "Daily_Type": dl["daily_type"],
+        "Last_Bar": pd.to_datetime(dl["bar_date"]).strftime("%Y-%m-%d"),
         "Last_Close": round(last_close, 2),
         "Target_PrevMonthHigh": round(target, 2),
         "Room_%": round(room_pct, 2),
@@ -386,32 +415,29 @@ def scan_scenario_1(ticker: str, daily: pd.DataFrame, use_last_completed_month: 
         "Status": "OK",
     }
 
-def scan_scenario_2(ticker: str, daily: pd.DataFrame, use_last_completed_month: bool, allow_daily_2u_as_actionable: bool) -> dict:
+def scan_scenario_2(ticker: str, daily: pd.DataFrame, allow_daily_2u_as_actionable: bool) -> dict:
     if daily is None or daily.empty or len(daily) < 60:
         return {"Ticker": ticker, "Score": 0.0, "Tier": "D", "Status": "No data"}
 
     mdf = to_monthly_ohlc(daily)
     wdf = to_weekly_ohlc(daily)
 
-    m = monthly_eval_block(mdf, use_last_completed_month)
-    d = daily_latest_block(daily)
+    mc = monthly_context(mdf)
+    dl = daily_latest_block(daily)
 
-    if not m.get("ok") or not d.get("ok"):
+    if not mc.get("ok") or not dl.get("ok"):
         return {"Ticker": ticker, "Score": 0.0, "Tier": "D", "Status": "Insufficient"}
 
     weekly_type = strat_type_latest(wdf)
-    monthly_type = m["monthly_type"]
 
-    # Scenario 2 monthly condition: 2U
-    month_ok = (monthly_type == "2U")
+    # Scenario 2 uses COMPLETED month context
+    completed_type = mc["completed_month_type"]
+    month_ok = (completed_type == "2U")
 
-    # Scenario 2 daily actionable:
-    # - always inside (1) is actionable (compression breakout)
-    # - optionally allow daily 2U to count as actionable (toggle)
-    daily_actionable = d["is_inside"] or (allow_daily_2u_as_actionable and d["is_2u"])
+    daily_actionable = dl["is_inside"] or (allow_daily_2u_as_actionable and dl["is_2u"])
 
-    target = m["target"]
-    last_close = d["last_close"]
+    target = mc["target"]
+    last_close = dl["last_close"]
     room_pct = (target - last_close) / last_close * 100.0
 
     prob = monthly_hit_probability_after_2d_green(daily, years=2)
@@ -424,11 +450,13 @@ def scan_scenario_2(ticker: str, daily: pd.DataFrame, use_last_completed_month: 
         "Score": score,
         "Tier": tier(score),
         "Weekly": weekly_type,
-        "Monthly_Type": monthly_type,
+        "Completed_Month": mc["completed_month_start"].strftime("%Y-%m"),
+        "Completed_Month_Type": completed_type,
+        "Current_Month": (mc["current_month_start"].strftime("%Y-%m") if mc["current_month_start"] is not None else XMARK),
+        "Current_Month_Type": mc["current_month_type"],
         "Actionable_Daily": ck(daily_actionable),
-        "Daily_Type": d["daily_type"],
-        "Eval_Month": m["eval_month_start"].strftime("%Y-%m"),
-        "Last_Bar": pd.to_datetime(d["bar_date"]).strftime("%Y-%m-%d"),
+        "Daily_Type": dl["daily_type"],
+        "Last_Bar": pd.to_datetime(dl["bar_date"]).strftime("%Y-%m-%d"),
         "Last_Close": round(last_close, 2),
         "Target_PrevMonthHigh": round(target, 2),
         "Room_%": round(room_pct, 2),
@@ -439,12 +467,11 @@ def scan_scenario_2(ticker: str, daily: pd.DataFrame, use_last_completed_month: 
 # -----------------------------
 # UI
 # -----------------------------
-st.title("2D Scan (STRAT) — v1.3.1 (Fixed Types)")
+st.title("2D Scan (STRAT) — v1.3.2 (Monthly Context Fix)")
 st.markdown(
     '<div class="muted">'
-    'Scenario 1: <b>M 2D+Green</b> → Actionable Daily (<b>2D or 1</b>) • '
-    'Scenario 2: <b>M 2U</b> → Actionable Daily (<b>1</b> + optional <b>2U</b>) • '
-    'Weekly shown as <b>1/2U/2D/3</b> (context only)'
+    'Now shows <b>Completed Month Type</b> (last closed) AND <b>Current Month Type</b> (in-progress) '
+    'so it matches what you see on TOS.'
     '</div>',
     unsafe_allow_html=True,
 )
@@ -458,9 +485,6 @@ with st.sidebar:
     )
     period = st.selectbox("History period", ["6mo", "1y", "2y", "5y"], index=2)
 
-    st.header("Monthly Handling")
-    use_last_completed_month = st.checkbox("Use last COMPLETED month (stable)", value=True)
-
     st.header("Scenario 2 Daily Actionable")
     allow_daily_2u_as_actionable = st.checkbox("Count daily 2U as actionable (optional)", value=False)
 
@@ -469,7 +493,6 @@ with st.sidebar:
 
     run = st.button("Run Scan", type="primary")
 
-# Universe build
 tickers: list[str] = []
 note = None
 
@@ -518,8 +541,8 @@ for i, t in enumerate(tickers, start=1):
     if df is None or df.empty:
         df = fetch_single_daily(t, period=period)
 
-    res1.append(scan_scenario_1(t, df, use_last_completed_month))
-    res2.append(scan_scenario_2(t, df, use_last_completed_month, allow_daily_2u_as_actionable))
+    res1.append(scan_scenario_1(t, df))
+    res2.append(scan_scenario_2(t, df, allow_daily_2u_as_actionable))
 
     progress.progress(i / max(len(tickers), 1))
 
@@ -534,16 +557,12 @@ if not df2.empty:
     df2 = df2[df2["Score"] >= float(min_score)].copy()
     df2 = df2.sort_values(["Score", "Room_%"], ascending=[False, False]).reset_index(drop=True)
 
-tab1, tab2 = st.tabs(["Scenario 1: M 2D+Green → Daily 2D/1", "Scenario 2: M 2U → Daily 1 (+ optional 2U)"])
+tab1, tab2 = st.tabs(["Scenario 1: Completed M 2D+Green → Daily 2D/1", "Scenario 2: Completed M 2U → Daily 1 (+ opt 2U)"])
 
 with tab1:
     st.subheader("Scenario 1 — Ranked Results")
     st.dataframe(df1, use_container_width=True, hide_index=True)
-    st.write(f"Shown: **{len(df1)}** / {len(res1)} (min score = {min_score})")
-    st.caption("Key columns to verify: Monthly_Type, Monthly_Green, Daily_Type, Actionable_Daily.")
 
 with tab2:
     st.subheader("Scenario 2 — Ranked Results")
     st.dataframe(df2, use_container_width=True, hide_index=True)
-    st.write(f"Shown: **{len(df2)}** / {len(res2)} (min score = {min_score})")
-    st.caption("Key columns to verify: Monthly_Type, Daily_Type, Actionable_Daily. Weekly is context only.")
