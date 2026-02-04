@@ -1,23 +1,26 @@
-# app.py (v1.0)
-# STRAT Scanner Dashboard (Streamlit)
+# app.py (v1.1)
+# STRAT Scanner Dashboard (Streamlit) — Ranking Engine (0–100)
 #
 # Setup logic:
-#   1) Monthly context: 2-Down month that closes green
-#        - low < prior low AND high <= prior high AND close > open
-#      (default uses last COMPLETED month to avoid repainting)
-#
-#   2) Daily trigger (latest day):
-#        - Failed 2 Down: low < prior low AND high > prior high  (often a 3 bar)
-#        - OR Inside Day: high < prior high AND low > prior low
-#
-#   3) Target: evaluated month high (the "prior month high" in your thesis)
-#      Room% = (target - last_close) / last_close * 100
+#   Monthly context (evaluated month):
+#     2-Down: low < prior low AND high <= prior high
+#     Green: close > open
+#   Daily trigger (latest day):
+#     Failed 2 Down: low < prior low AND high > prior high
+#     Inside Day: high < prior high AND low > prior low
+#   Target: evaluated month high
 #
 # Probabilities (2-year empirical):
 #   After a 2-down green month, probability price hits that month’s high in the FOLLOWING month.
 #
+# Ranking Score (0–100):
+#   Monthly (0–40): 2Down +20, Green +20
+#   Daily (0–30): Failed2 +30, Inside +20
+#   Room (0–15): 1 point per 1% room (cap 15)
+#   Probability (0–15): hit_rate% mapped to 0–15
+#
 # Universe:
-#   - Top 50 (Mega Caps: S&P 500 + Nasdaq-100) by market cap, with fallback list.
+#   Top 50 mega caps (S&P500 + Nasdaq-100) by market cap, with fallback list.
 #
 # Requirements (requirements.txt):
 #   streamlit
@@ -36,10 +39,38 @@ import requests
 from io import StringIO
 from datetime import datetime, timezone
 
-st.set_page_config(page_title="2D Scan (STRAT) v1.0", layout="wide")
+st.set_page_config(page_title="2D Scan (STRAT) v1.1", layout="wide")
 
 # -----------------------------
-# Fallback universe (keeps app running even if Wikipedia blocks)
+# Styling (green checkmarks)
+# -----------------------------
+CHECK = "✅"
+XMARK = "—"
+
+st.markdown(
+    """
+    <style>
+      /* make the dataframe area breathe */
+      .stDataFrame { padding-top: 0.25rem; }
+
+      /* nicer headings spacing */
+      h1, h2, h3 { margin-bottom: 0.25rem; }
+
+      /* green check emoji fallback (emoji already green, but keep consistent) */
+      .green-check { color: #16a34a; font-weight: 700; }
+
+      /* small muted caption */
+      .muted { color: rgba(120,120,120,0.9); font-size: 0.92rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+def ck(v: bool) -> str:
+    return CHECK if bool(v) else XMARK
+
+# -----------------------------
+# Fallback universe
 # -----------------------------
 DEFAULT_TOP50 = [
     "AAPL","MSFT","NVDA","AMZN","GOOGL","GOOG","META","BRK-B","LLY","AVGO",
@@ -50,7 +81,7 @@ DEFAULT_TOP50 = [
 ]
 
 # -----------------------------
-# Wikipedia HTML fetch (avoids 403 on Streamlit Cloud)
+# Wikipedia fetch (avoid 403)
 # -----------------------------
 def _fetch_html(url: str) -> str:
     headers = {
@@ -126,7 +157,7 @@ def get_top50_by_marketcap(tickers: list[str]) -> pd.DataFrame:
     return df
 
 # -----------------------------
-# Data fetch (batch + fallback)
+# Data fetch
 # -----------------------------
 @st.cache_data(ttl=60 * 15)
 def fetch_batch_daily(tickers: list[str], period: str = "2y") -> dict[str, pd.DataFrame]:
@@ -205,7 +236,7 @@ def to_monthly_ohlc(daily: pd.DataFrame) -> pd.DataFrame:
     ).dropna(subset=["Open", "High", "Low", "Close"])
     return monthly
 
-def strat_month_2down_green(monthly: pd.DataFrame, use_last_completed_month: bool = True) -> dict:
+def strat_month_flags(monthly: pd.DataFrame, use_last_completed_month: bool = True) -> dict:
     if monthly is None or monthly.empty or len(monthly) < 3:
         return {"ok": False}
 
@@ -222,18 +253,17 @@ def strat_month_2down_green(monthly: pd.DataFrame, use_last_completed_month: boo
 
     month_2down = (m["Low"] < m_prev["Low"]) and (m["High"] <= m_prev["High"])
     month_green = (m["Close"] > m["Open"])
-    month_condition = bool(month_2down and month_green)
+    target = float(m["High"])
 
     return {
         "ok": True,
-        "month_condition": month_condition,
+        "eval_month_start": monthly.index[eval_pos],
         "month_2down": bool(month_2down),
         "month_green": bool(month_green),
-        "eval_month_start": monthly.index[eval_pos],
-        "target_prior_month_high": float(m["High"]),
+        "target_prior_month_high": target,
     }
 
-def strat_daily_triggers(daily: pd.DataFrame) -> dict:
+def strat_daily_flags(daily: pd.DataFrame) -> dict:
     if daily is None or daily.empty or len(daily) < 3:
         return {"ok": False}
 
@@ -305,60 +335,110 @@ def monthly_hit_probability(daily: pd.DataFrame, years: int = 2) -> dict:
 
     return {"setups": setups, "hit_rate": hit_rate, "avg_days": avg_days}
 
+def score_setup(month2down: bool, monthgreen: bool, failed2: bool, inside: bool, room_pct: float, hit_rate_pct: float) -> float:
+    score = 0.0
+
+    # Monthly (0–40)
+    score += 20.0 if month2down else 0.0
+    score += 20.0 if monthgreen else 0.0
+
+    # Daily (0–30)
+    if failed2:
+        score += 30.0
+    elif inside:
+        score += 20.0
+
+    # Room (0–15) (cap at 15%)
+    score += max(0.0, min(15.0, room_pct))
+
+    # Probability (0–15)
+    score += max(0.0, min(15.0, (hit_rate_pct / 100.0) * 15.0))
+
+    return round(score, 1)
+
+def tier_from_score(score: float) -> str:
+    if score >= 80:
+        return "A"
+    if score >= 65:
+        return "B"
+    if score >= 50:
+        return "C"
+    return "D"
+
 def scan_one(
     ticker: str,
     daily: pd.DataFrame,
     use_last_completed_month: bool,
     require_failed2_green: bool,
-    min_room_pct: float,
 ) -> dict:
     if daily is None or daily.empty or len(daily) < 60:
-        return {"Ticker": ticker, "Match": False, "Status": "No/insufficient data"}
+        return {"Ticker": ticker, "Score": 0.0, "Tier": "D", "Status": "No/insufficient data"}
 
     monthly = to_monthly_ohlc(daily)
-    m = strat_month_2down_green(monthly, use_last_completed_month=use_last_completed_month)
-    d = strat_daily_triggers(daily)
+    m = strat_month_flags(monthly, use_last_completed_month=use_last_completed_month)
+    d = strat_daily_flags(daily)
 
     if not m.get("ok") or not d.get("ok"):
-        return {"Ticker": ticker, "Match": False, "Status": "Insufficient candles"}
+        return {"Ticker": ticker, "Score": 0.0, "Tier": "D", "Status": "Insufficient candles"}
 
-    month_ok = m["month_condition"]
-    failed2_ok = d["failed2_down_green"] if require_failed2_green else d["failed2_down"]
-    inside_ok = d["inside_day"]
-    daily_ok = bool(failed2_ok or inside_ok)
-
-    last_close = d["last_close"]
+    # Monthly flags
+    month2down = m["month_2down"]
+    monthgreen = m["month_green"]
+    eval_month = m["eval_month_start"].strftime("%Y-%m")
     target = m["target_prior_month_high"]
+
+    # Daily flags
+    failed2 = d["failed2_down_green"] if require_failed2_green else d["failed2_down"]
+    inside = d["inside_day"]
+    last_bar = pd.to_datetime(d["bar_date"]).strftime("%Y-%m-%d")
+    last_close = d["last_close"]
+
+    trigger = "FAILED2D" if failed2 else ("INSIDE" if inside else "—")
+
+    # Room
     room_pct = (target - last_close) / last_close * 100.0
 
+    # Probability (2y)
     prob = monthly_hit_probability(daily, years=2)
+    hit_rate_pct = prob["hit_rate"] * 100.0
 
-    match = bool(month_ok and daily_ok and (room_pct >= min_room_pct))
-
-    trigger = "FAILED2D" if failed2_ok else ("INSIDE" if inside_ok else "—")
+    # Score + tier
+    score = score_setup(
+        month2down=month2down,
+        monthgreen=monthgreen,
+        failed2=failed2,
+        inside=inside,
+        room_pct=room_pct,
+        hit_rate_pct=hit_rate_pct,
+    )
+    tier = tier_from_score(score)
 
     return {
         "Ticker": ticker,
-        "Match": match,
+        "Score": score,
+        "Tier": tier,
         "Trigger": trigger,
-        "Monthly_2Down": m["month_2down"],
-        "Monthly_Green": m["month_green"],
-        "Eval_Month": m["eval_month_start"].strftime("%Y-%m"),
-        "Last_Bar": pd.to_datetime(d["bar_date"]).strftime("%Y-%m-%d"),
+        "Monthly_2Down": ck(month2down),
+        "Monthly_Green": ck(monthgreen),
+        "Eval_Month": eval_month,
+        "Last_Bar": last_bar,
         "Last_Close": round(last_close, 2),
         "Target_PriorMonthHigh": round(target, 2),
         "Room_To_Target_%": round(room_pct, 2),
         "Setup_Count_2Y": int(prob["setups"]),
-        "Hit_Rate_%_2Y": round(prob["hit_rate"] * 100.0, 1),
+        "Hit_Rate_%_2Y": round(hit_rate_pct, 1),
         "Avg_Days_To_Target_2Y": (round(prob["avg_days"], 1) if prob["avg_days"] is not None else None),
-        "Status": "OK" if match else "No match",
+        "Status": "OK",
     }
 
 # -----------------------------
 # UI
 # -----------------------------
-st.title("2D Scan (STRAT) — v1.0")
-st.caption("Monthly: **2-Down + Green** • Daily: **Failed2D or Inside** • Target: **prior month high** • Probability: **2-year hit rate**")
+st.title("2D Scan (STRAT) — v1.1 (Ranked)")
+st.markdown(
+    '<div class="muted">Monthly: <b>2-Down + Green</b> • Daily: <b>Failed2D or Inside</b> • Target: <b>prior month high</b> • Probability: <b>2-year hit rate</b> • Output: <b>Score 0–100</b></div>',
+    unsafe_allow_html=True,
+)
 
 with st.sidebar:
     st.header("Universe")
@@ -374,10 +454,12 @@ with st.sidebar:
 
     period = st.selectbox("History period (download)", ["6mo", "1y", "2y", "5y"], index=2)
 
-    st.header("Rules")
+    st.header("Signal Rules")
     use_last_completed_month = st.checkbox("Use last COMPLETED month (stable)", value=True)
     require_failed2_green = st.checkbox("Require Failed 2 Down to close green", value=False)
-    min_room_pct = st.number_input("Min room to prior month high (%)", value=0.0, step=0.5)
+
+    st.header("Ranking Filters")
+    min_score = st.slider("Minimum Score", 0, 100, 60)
 
     run = st.button("Run Scan", type="primary")
 
@@ -420,7 +502,7 @@ if universe_note:
     st.info(universe_note)
 
 if not run:
-    st.write("Click **Run Scan** to generate results.")
+    st.write("Click **Run Scan** to generate ranked results.")
     st.stop()
 
 if not tickers:
@@ -431,14 +513,12 @@ if not tickers:
 st.info(f"Downloading daily data (batch) for {len(tickers)} tickers…")
 batch = fetch_batch_daily(tickers, period=period)
 
-# If batch misses too many, allow single-ticker fallback during scanning
+# Scan loop
 results = []
 progress = st.progress(0)
 
 for i, t in enumerate(tickers, start=1):
     df = batch.get(t, pd.DataFrame())
-
-    # fallback to single download if batch missed this ticker
     if df is None or df.empty:
         df = fetch_single_daily(t, period=period)
 
@@ -448,33 +528,23 @@ for i, t in enumerate(tickers, start=1):
             daily=df,
             use_last_completed_month=use_last_completed_month,
             require_failed2_green=require_failed2_green,
-            min_room_pct=float(min_room_pct),
         )
     )
     progress.progress(i / max(len(tickers), 1))
 
 res = pd.DataFrame(results)
 
-# Sort: Matches first, then highest probability, then most room
-sort_cols = []
-if "Match" in res.columns:
-    sort_cols.append("Match")
-if "Hit_Rate_%_2Y" in res.columns:
-    sort_cols.append("Hit_Rate_%_2Y")
-if "Room_To_Target_%" in res.columns:
-    sort_cols.append("Room_To_Target_%")
+# Filter + sort
+if not res.empty:
+    res = res[res["Score"] >= float(min_score)].copy()
+    res = res.sort_values(["Score", "Room_To_Target_%"], ascending=[False, False]).reset_index(drop=True)
 
-if sort_cols:
-    ascending = [False] * len(sort_cols)
-    res = res.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
-
-st.subheader("Scan Results")
+st.subheader("Ranked Results")
 st.dataframe(res, use_container_width=True, hide_index=True)
 
-matches = res[res["Match"] == True]
-st.write(f"Matches: **{len(matches)}** / {len(res)}")
+st.write(f"Shown: **{len(res)}** / {len(results)} (min score = {min_score})")
 
 st.caption(
-    "Probability columns are an empirical 2-year hit rate: after a **2-down green month**, "
-    "how often price hits that month’s high during the following month."
+    "✅ = condition met. Score is a weighted ranking (Monthly + Daily trigger + Room + 2Y hit rate). "
+    "This is an opportunity list, not a binary match filter."
 )
