@@ -150,4 +150,4 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
         "Volume": g["Volume"].sum(),
     }).dropna(subset=["Open", "High", "Low", "Close"])
 
-    return ou
+    return out
