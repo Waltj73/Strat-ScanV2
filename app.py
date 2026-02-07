@@ -1,29 +1,87 @@
-# app.py
+# app.py — STRAT-only Scanner (modular, crash-proof navigation)
 
-import os, sys
+import os
+import sys
+import importlib
+
+import streamlit as st
+
+# ----------------------------
+# Ensure project root is importable
+# ----------------------------
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-import streamlit as st
+st.set_page_config(page_title="STRAT Scanner (Modular)", layout="wide")
 
-from app_pages.scanner import show as scanner_main
-from app_pages.dashboard import dashboard_main
-from app_pages.ticker_analyzer import analyzer_main
-from app_pages.guide import guide_main
-from app_pages.cheat_sheet import cheat_sheet_main
 
-st.set_page_config(page_title="STRAT-only Scanner", layout="wide")
+def _module_exists(module_path: str) -> bool:
+    """
+    module_path like: 'app_pages.scanner'
+    Checks if a corresponding .py file exists.
+    """
+    parts = module_path.split(".")
+    rel_path = os.path.join(ROOT, *parts) + ".py"
+    return os.path.exists(rel_path)
 
-PAGES = {
-    "Scanner": scanner_main,
-    "Dashboard": dashboard_main,
-    "Ticker Analyzer": analyzer_main,
-    "Guide": guide_main,
-    "Cheat Sheet": cheat_sheet_main,
-}
 
-st.sidebar.title("Navigation")
-choice = st.sidebar.radio("Go to", list(PAGES.keys()), index=0)
+def _safe_import(module_path: str, func_name: str):
+    """
+    Returns callable or None. Shows a nice error in-app if import fails.
+    """
+    try:
+        mod = importlib.import_module(module_path)
+        fn = getattr(mod, func_name, None)
+        if fn is None:
+            st.error(f"Missing function `{func_name}()` in `{module_path}.py`")
+            return None
+        return fn
+    except Exception as e:
+        st.error(f"Failed to import `{module_path}` → {e}")
+        return None
 
-PAGES[choice]()
+
+# ----------------------------
+# Page registry (only what exists)
+# ----------------------------
+PAGES = []  # (label, module_path, function_name)
+
+# Scanner
+if _module_exists("app_pages.scanner"):
+    PAGES.append(("📡 Scanner", "app_pages.scanner", "scanner_main"))
+
+# Ticker Analyzer
+if _module_exists("app_pages.ticker_analyzer"):
+    PAGES.append(("🔎 Ticker Analyzer", "app_pages.ticker_analyzer", "analyzer_main"))
+
+# Cheat Sheet
+if _module_exists("app_pages.cheat_sheet"):
+    PAGES.append(("🧾 Cheat Sheet", "app_pages.cheat_sheet", "cheat_sheet_main"))
+
+# Guide
+if _module_exists("app_pages.guide"):
+    PAGES.append(("📘 Guide", "app_pages.guide", "guide_main"))
+
+# Dashboard (optional)
+if _module_exists("app_pages.dashboard"):
+    PAGES.append(("📊 Dashboard", "app_pages.dashboard", "dashboard_main"))
+
+st.sidebar.title("STRAT Scanner")
+st.sidebar.caption("Modular build • STRAT-only • crash-proof")
+
+if not PAGES:
+    st.error("No pages found. Make sure you have at least `app_pages/scanner.py` with `scanner_main()`.")
+    st.stop()
+
+labels = [p[0] for p in PAGES]
+choice = st.sidebar.radio("Navigation", labels, index=0)
+
+# Run selected page
+label, module_path, func_name = next(p for p in PAGES if p[0] == choice)
+page_fn = _safe_import(module_path, func_name)
+
+if page_fn:
+    page_fn()
+else:
+    st.info("Fix the error shown above, then refresh.")
