@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 
 from data.fetch import get_hist, resample_ohlc
-from data.universe import MARKET_ETFS, SECTOR_ETFS, SECTOR_TICKERS
+from config.universe import MARKET_ETFS, SECTOR_ETFS, SECTOR_TICKERS
 from strat.core import (
     candle_type_label,
     compute_flags,
