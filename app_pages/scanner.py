@@ -230,3 +230,8 @@ def show():
     st.dataframe(scan_df, use_container_width=True, hide_index=True)
 
     st.caption("Trigger levels are bias-aware. LONG = break IB high / stop below. SHORT = break IB low / stop above.")
+
+# Streamlit entry point
+def scanner_main():
+    show()
+
