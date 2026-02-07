@@ -246,3 +246,7 @@ def show():
     st.dataframe(scan_df, use_container_width=True, hide_index=True)
 
     st.caption("Note: Trigger levels are bias-aware. LONG = break IB high / stop below. SHORT = break IB low / stop above.")
+
+def scanner_main():
+    show()
+
