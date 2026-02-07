@@ -1,4 +1,5 @@
 # app_pages/scanner.py
+
 import math
 from datetime import datetime, timezone
 
@@ -16,6 +17,10 @@ from strat.core import (
     best_trigger,
 )
 
+def scanner_main():
+    # ✅ This is what app.py imports
+    show()
+
 def _checkify(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     out = df.copy()
     for c in cols:
@@ -24,15 +29,19 @@ def _checkify(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return out
 
 def _rotation_lists(sectors_df: pd.DataFrame, bias: str, n: int = 3):
+    """
+    STRAT-only 'rotation' = which sector ETFs are most aligned with the bias (IN)
+    vs most opposed (OUT), based on BullScore/BearScore dominance.
+    """
     df = sectors_df.copy()
-    df["Diff"] = df["BullScore"] - df["BearScore"]
+    df["Diff"] = df["BullScore"] - df["BearScore"]  # + = bullish dominance
 
     if bias == "LONG":
-        rot_in = df.sort_values(["Diff", "BullScore"], ascending=[False, False]).head(n)
-        rot_out = df.sort_values(["Diff", "BearScore"], ascending=[True, False]).head(n)
+        rot_in = df.sort_values(["Diff","BullScore"], ascending=[False, False]).head(n)
+        rot_out = df.sort_values(["Diff","BearScore"], ascending=[True, False]).head(n)
     elif bias == "SHORT":
-        rot_in = df.sort_values(["Diff", "BearScore"], ascending=[True, False]).head(n)
-        rot_out = df.sort_values(["Diff", "BullScore"], ascending=[False, False]).head(n)
+        rot_in = df.sort_values(["Diff","BearScore"], ascending=[True, False]).head(n)
+        rot_out = df.sort_values(["Diff","BullScore"], ascending=[False, False]).head(n)
     else:
         rot_in = df.sort_values("Diff", ascending=False).head(n)
         rot_out = df.sort_values("Diff", ascending=True).head(n)
@@ -40,11 +49,19 @@ def _rotation_lists(sectors_df: pd.DataFrame, bias: str, n: int = 3):
     return rot_in, rot_out
 
 def show():
-    st.caption("STRAT-only • Market Regime • Sector Rotation • Rotation IN/OUT • Sector Drilldown")
+    st.title("Scanner (STRAT-only)")
+    st.caption("Scanner + Sector Drilldown. STRAT-only.")
+
+    topbar = st.columns([1, 1, 6])
+    with topbar[0]:
+        if st.button("Refresh data"):
+            st.cache_data.clear()
+            st.rerun()
+
     st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
     # =========================
-    # MARKET REGIME
+    # MARKET REGIME (STRAT-only)
     # =========================
     st.subheader("Market Regime (STRAT-only) — SPY / QQQ / IWM / DIA")
 
@@ -81,7 +98,7 @@ def show():
         })
 
     market_df = pd.DataFrame(market_rows)
-    market_df = _checkify(market_df, ["D_Inside", "W_Inside", "M_Inside"])
+    market_df = _checkify(market_df, ["D_Inside","W_Inside","M_Inside"])
     st.dataframe(market_df, use_container_width=True, hide_index=True)
 
     bias, strength, diff = market_bias_and_strength(market_rows)
@@ -94,7 +111,7 @@ def show():
         st.warning(f"Bias: **MIXED** 🟠 | STRAT Strength: **{strength}/100** | Bull–Bear diff: **{diff}**")
 
     # =========================
-    # SECTOR ROTATION
+    # SECTOR ROTATION (STRAT-only)
     # =========================
     st.subheader("Sector Rotation (STRAT-only) — ranked by bias")
 
@@ -138,9 +155,9 @@ def show():
     sectors_df["Diff"] = sectors_df["BullScore"] - sectors_df["BearScore"]
 
     if bias == "LONG":
-        sectors_df = sectors_df.sort_values(["Diff", "BullScore"], ascending=[False, False])
+        sectors_df = sectors_df.sort_values(["Diff","BullScore"], ascending=[False, False])
     elif bias == "SHORT":
-        sectors_df = sectors_df.sort_values(["Diff", "BearScore"], ascending=[True, False])
+        sectors_df = sectors_df.sort_values(["Diff","BearScore"], ascending=[True, False])
     else:
         sectors_df = sectors_df.sort_values(["Diff"], ascending=False)
 
@@ -155,7 +172,7 @@ def show():
     st.dataframe(out_df, use_container_width=True, hide_index=True)
 
     # =========================
-    # ROTATION IN/OUT
+    # QUICK MARKET READ + ROTATION IN/OUT
     # =========================
     st.subheader("Quick Market Read + Rotation IN/OUT")
 
@@ -166,13 +183,14 @@ def show():
         st.markdown("### 🔁 Rotation IN")
         for _, r in rot_in.iterrows():
             st.write(f"✅ **{r['Sector']}** ({r['ETF']}) — Bull {int(r['BullScore'])} / Bear {int(r['BearScore'])} | Diff {int(r['Diff'])}")
+
     with c2:
         st.markdown("### 🔁 Rotation OUT")
         for _, r in rot_out.iterrows():
             st.write(f"❌ **{r['Sector']}** ({r['ETF']}) — Bull {int(r['BullScore'])} / Bear {int(r['BearScore'])} | Diff {int(r['Diff'])}")
 
     # =========================
-    # DRILLDOWN
+    # DRILL INTO A SECTOR (bias-aware triggers)
     # =========================
     st.subheader("Drill into a Sector (scan tickers inside that group)")
 
@@ -229,9 +247,4 @@ def show():
     scan_df = _checkify(scan_df, ["D_Inside","W_Inside","M_Inside","D_212Up","W_212Up","D_212Dn","W_212Dn"])
     st.dataframe(scan_df, use_container_width=True, hide_index=True)
 
-    st.caption("Trigger levels are bias-aware. LONG = break IB high / stop below. SHORT = break IB low / stop above.")
-
-# Streamlit entry point
-def scanner_main():
-    show()
-
+    st.caption("Note: Trigger levels are bias-aware. LONG = break IB high / stop below. SHORT = break IB low / stop above.")
