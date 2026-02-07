@@ -14,29 +14,34 @@ from strat.core import (
     market_bias_and_strength,
 )
 
+def _checkify(df: pd.DataFrame, cols):
+    out = df.copy()
+    for c in cols:
+        if c in out.columns:
+            out[c] = out[c].apply(lambda v: "✅" if bool(v) else "")
+    return out
+
+
 def dashboard_main():
     st.title("STRAT Dashboard")
-    st.caption("STRAT-only market regime + sector alignment")
+    st.caption("Market Bias + Sector Alignment (STRAT-only)")
 
     if st.button("Refresh data"):
         st.cache_data.clear()
         st.rerun()
 
-    st.caption(
-        f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-    )
+    st.caption(f"Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
-    # =====================
-    # MARKET REGIME
-    # =====================
-    st.subheader("Market Regime")
+    # =========================
+    # MARKET BIAS
+    # =========================
+    st.subheader("Market Bias")
 
     market_rows = []
-
     for name, sym in MARKET_ETFS.items():
         d = get_hist(sym)
-
         if d.empty:
+            flags = {}
             bull = bear = 0
             d_type = w_type = m_type = "n/a"
         else:
@@ -54,42 +59,39 @@ def dashboard_main():
         market_rows.append({
             "Market": name,
             "Ticker": sym,
-            "Daily": d_type,
-            "Weekly": w_type,
-            "Monthly": m_type,
-            "BullScore": bull,
-            "BearScore": bear,
+            "D": d_type,
+            "W": w_type,
+            "M": m_type,
+            "Bull": bull,
+            "Bear": bear,
+            "D_Inside": flags.get("D_Inside", False),
+            "W_Inside": flags.get("W_Inside", False),
+            "M_Inside": flags.get("M_Inside", False),
         })
 
-    market_df = pd.DataFrame(market_rows)
-    st.dataframe(market_df, use_container_width=True, hide_index=True)
+    mdf = pd.DataFrame(market_rows)
+    mdf = _checkify(mdf, ["D_Inside","W_Inside","M_Inside"])
+    st.dataframe(mdf, use_container_width=True, hide_index=True)
 
     bias, strength, diff = market_bias_and_strength(market_rows)
 
     if bias == "LONG":
-        st.success(
-            f"Market Bias: LONG 🟢 | Strength: {strength}/100 | Diff: {diff}"
-        )
+        st.success(f"Market Bias: LONG 🟢 | Strength {strength}/100 | Diff {diff}")
     elif bias == "SHORT":
-        st.error(
-            f"Market Bias: SHORT 🔴 | Strength: {strength}/100 | Diff: {diff}"
-        )
+        st.error(f"Market Bias: SHORT 🔴 | Strength {strength}/100 | Diff {diff}")
     else:
-        st.warning(
-            f"Market Bias: MIXED 🟠 | Strength: {strength}/100 | Diff: {diff}"
-        )
+        st.warning(f"Market Bias: MIXED 🟠 | Strength {strength}/100 | Diff {diff}")
 
-    # =====================
+    # =========================
     # SECTOR ALIGNMENT
-    # =====================
+    # =========================
     st.subheader("Sector Alignment")
 
     sector_rows = []
-
     for sector, etf in SECTOR_ETFS.items():
         d = get_hist(etf)
-
         if d.empty:
+            flags = {}
             bull = bear = 0
             d_type = w_type = m_type = "n/a"
         else:
@@ -107,21 +109,27 @@ def dashboard_main():
         sector_rows.append({
             "Sector": sector,
             "ETF": etf,
-            "Daily": d_type,
-            "Weekly": w_type,
-            "Monthly": m_type,
-            "BullScore": bull,
-            "BearScore": bear,
+            "D": d_type,
+            "W": w_type,
+            "M": m_type,
+            "Bull": bull,
+            "Bear": bear,
+            "Diff": bull - bear,
+            "D_Inside": flags.get("D_Inside", False),
+            "W_Inside": flags.get("W_Inside", False),
         })
 
-    sector_df = pd.DataFrame(sector_rows)
-    sector_df["Diff"] = sector_df["BullScore"] - sector_df["BearScore"]
+    sdf = pd.DataFrame(sector_rows)
 
     if bias == "LONG":
-        sector_df = sector_df.sort_values("Diff", ascending=False)
+        sdf = sdf.sort_values(["Diff","Bull"], ascending=[False, False])
     elif bias == "SHORT":
-        sector_df = sector_df.sort_values("Diff", ascending=True)
+        sdf = sdf.sort_values(["Diff","Bear"], ascending=[True, False])
+    else:
+        sdf = sdf.sort_values("Diff", ascending=False)
 
-    st.dataframe(sector_df, use_container_width=True, hide_index=True)
+    sdf = _checkify(sdf, ["D_Inside","W_Inside"])
 
-    st.caption("Top sectors align with market bias.")
+    st.dataframe(sdf, use_container_width=True, hide_index=True)
+
+    st.caption("Goal: trade strongest sectors in bias direction.")
