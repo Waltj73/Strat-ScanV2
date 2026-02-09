@@ -1,86 +1,24 @@
 # strat/core.py
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple
 import pandas as pd
 
-
 # -------------------------
-# Helpers: normalize OHLC
-# -------------------------
-REQUIRED = ["Open", "High", "Low", "Close"]
-
-def _norm_ohlc(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure df has Open/High/Low/Close with correct casing."""
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    out = df.copy()
-
-    # normalize common lowercase variants
-    rename = {}
-    for c in out.columns:
-        if not isinstance(c, str):
-            continue
-        lc = c.strip().lower()
-        if lc == "open":
-            rename[c] = "Open"
-        elif lc == "high":
-            rename[c] = "High"
-        elif lc == "low":
-            rename[c] = "Low"
-        elif lc == "close":
-            rename[c] = "Close"
-        elif lc in ("adj close", "adj_close", "adjclose"):
-            # only map to Close if Close doesn't exist
-            if "Close" not in out.columns:
-                rename[c] = "Close"
-
-    if rename:
-        out = out.rename(columns=rename)
-
-    # If Close still missing, try Adj Close style column
-    if "Close" not in out.columns:
-        for alt in ["Adj Close", "adj close", "Adj_Close", "AdjClose"]:
-            if alt in out.columns:
-                out["Close"] = out[alt]
-                break
-
-    # Must have OHLC
-    if not set(REQUIRED).issubset(set(out.columns)):
-        return pd.DataFrame()
-
-    # Coerce numeric
-    for c in REQUIRED:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-
-    out = out.dropna(subset=REQUIRED)
-    return out
-
-
-# -------------------------
-# STRAT candle logic
+# Candle helpers
 # -------------------------
 def candle_color(cur: pd.Series) -> str:
-    try:
-        o = float(cur["Open"])
-        c = float(cur["Close"])
-    except Exception:
-        return "doji"
-
+    o = float(cur["Open"])
+    c = float(cur["Close"])
     if c > o:
         return "green"
     if c < o:
         return "red"
     return "doji"
 
-
 def candle_type(cur: pd.Series, prev: pd.Series) -> str:
-    try:
-        hi, lo = float(cur["High"]), float(cur["Low"])
-        phi, plo = float(prev["High"]), float(prev["Low"])
-    except Exception:
-        return "?"
+    hi, lo = float(cur["High"]), float(cur["Low"])
+    phi, plo = float(prev["High"]), float(prev["Low"])
 
     inside = (hi <= phi) and (lo >= plo)
     two_up = (hi > phi) and (lo >= plo)
@@ -97,68 +35,96 @@ def candle_type(cur: pd.Series, prev: pd.Series) -> str:
         return "3"
     return "?"
 
-
-def last_two(df: pd.DataFrame) -> Optional[Tuple[pd.Series, pd.Series]]:
-    df = _norm_ohlc(df)
-    if df.empty or len(df) < 2:
-        return None
-    return df.iloc[-1], df.iloc[-2]
-
-
 def candle_type_label(df: pd.DataFrame) -> str:
-    pair = last_two(df)
-    if not pair:
+    if df is None or df.empty or len(df) < 2:
         return "n/a"
-    cur, prev = pair
+    cur, prev = df.iloc[-1], df.iloc[-2]
     return candle_type(cur, prev)
 
+def candle_type_with_color(df: pd.DataFrame) -> str:
+    if df is None or df.empty or len(df) < 2:
+        return "n/a"
+    cur, prev = df.iloc[-1], df.iloc[-2]
+    t = candle_type(cur, prev)
+    col = candle_color(cur)
+    if col == "green":
+        return f"{t} (G)"
+    if col == "red":
+        return f"{t} (R)"
+    return f"{t} (D)"
+
+def in_force_label(df: pd.DataFrame) -> str:
+    """
+    STRAT-ish "in force":
+      IF_UP   = close > prior high
+      IF_DOWN = close < prior low
+      —       = otherwise (including 2D green close inside prior range, etc.)
+    """
+    if df is None or df.empty or len(df) < 2:
+        return "—"
+    cur, prev = df.iloc[-1], df.iloc[-2]
+    c = float(cur["Close"])
+    phi, plo = float(prev["High"]), float(prev["Low"])
+    if c > phi:
+        return "IF_UP"
+    if c < plo:
+        return "IF_DOWN"
+    return "—"
+
+def last_two(df: pd.DataFrame) -> Optional[Tuple[pd.Series, pd.Series]]:
+    if df is None or df.empty or len(df) < 2:
+        return None
+    return df.iloc[-1], df.iloc[-2]
 
 # -------------------------
 # 2-1-2 patterns
 # -------------------------
 def _is_212_up(df: pd.DataFrame) -> bool:
-    df = _norm_ohlc(df)
-    if df.empty or len(df) < 4:
+    if df is None or df.empty or len(df) < 4:
         return False
     a, b, c = df.iloc[-3], df.iloc[-2], df.iloc[-1]
     pa = df.iloc[-4]
     return (candle_type(a, pa) == "2U") and (candle_type(b, a) == "1") and (candle_type(c, b) == "2U")
 
-
 def _is_212_dn(df: pd.DataFrame) -> bool:
-    df = _norm_ohlc(df)
-    if df.empty or len(df) < 4:
+    if df is None or df.empty or len(df) < 4:
         return False
     a, b, c = df.iloc[-3], df.iloc[-2], df.iloc[-1]
     pa = df.iloc[-4]
     return (candle_type(a, pa) == "2D") and (candle_type(b, a) == "1") and (candle_type(c, b) == "2D")
 
-
 # -------------------------
-# Flags + scoring
+# STRAT flags + scoring
 # -------------------------
 def compute_flags(d: pd.DataFrame, w: pd.DataFrame, m: pd.DataFrame) -> Dict[str, bool]:
     def tf_flags(prefix: str, df: pd.DataFrame) -> Dict[str, bool]:
         pair = last_two(df)
         if not pair:
             return {
-                f"{prefix}_Bull": False,
-                f"{prefix}_Bear": False,
-                f"{prefix}_Inside": False,
+                f"{prefix}_Bull": False, f"{prefix}_Bear": False, f"{prefix}_Inside": False,
+                f"{prefix}_IF_Up": False, f"{prefix}_IF_Down": False,
             }
 
         cur, prev = pair
-        t = candle_type(cur, prev).strip().upper()
-        col = candle_color(cur)
+        t = candle_type(cur, prev)
 
-        bull = (t == "2U") or (t == "3" and col == "green")
-        bear = (t == "2D") or (t == "3" and col == "red")
+        # in-force
+        c = float(cur["Close"])
+        phi, plo = float(prev["High"]), float(prev["Low"])
+        if_up = c > phi
+        if_down = c < plo
+
+        # Directional flags: keep it simple, but now use "in force" first
+        bull = (t == "2U") or (t == "3" and candle_color(cur) == "green")
+        bear = (t == "2D") or (t == "3" and candle_color(cur) == "red")
         inside = (t == "1")
 
         return {
-            f"{prefix}_Bull": bool(bull),
-            f"{prefix}_Bear": bool(bear),
-            f"{prefix}_Inside": bool(inside),
+            f"{prefix}_Bull": bull,
+            f"{prefix}_Bear": bear,
+            f"{prefix}_Inside": inside,
+            f"{prefix}_IF_Up": bool(if_up),
+            f"{prefix}_IF_Down": bool(if_down),
         }
 
     flags: Dict[str, bool] = {}
@@ -172,7 +138,6 @@ def compute_flags(d: pd.DataFrame, w: pd.DataFrame, m: pd.DataFrame) -> Dict[str
     flags["W_212Dn"] = _is_212_dn(w)
 
     return flags
-
 
 def score_regime(flags: Dict[str, bool]) -> Tuple[int, int]:
     bull = 0
@@ -193,27 +158,17 @@ def score_regime(flags: Dict[str, bool]) -> Tuple[int, int]:
 
     return bull, bear
 
-
-# -------------------------
-# Market bias + triggers
-# (Keep your existing versions if you already have them elsewhere)
-# -------------------------
-def market_bias_and_strength(rows: List[Dict]) -> Tuple[str, int, int]:
-    bull_total = sum(int(r.get("BullScore", 0)) for r in rows)
-    bear_total = sum(int(r.get("BearScore", 0)) for r in rows)
+def market_bias_and_strength(market_rows: list[dict]) -> Tuple[str, int, int]:
+    bull_total = sum(int(r.get("BullScore", 0)) for r in market_rows)
+    bear_total = sum(int(r.get("BearScore", 0)) for r in market_rows)
     diff = bull_total - bear_total
-
     strength = max(0, min(100, int(50 + diff * 5)))
 
     if diff >= 3:
-        bias = "LONG"
-    elif diff <= -3:
-        bias = "SHORT"
-    else:
-        bias = "MIXED"
-
-    return bias, strength, diff
-
+        return "LONG", strength, diff
+    if diff <= -3:
+        return "SHORT", strength, diff
+    return "MIXED", strength, diff
 
 def best_trigger(bias: str, d: pd.DataFrame, w: pd.DataFrame):
     """
@@ -221,28 +176,23 @@ def best_trigger(bias: str, d: pd.DataFrame, w: pd.DataFrame):
     LONG: entry = IB high, stop = IB low
     SHORT: entry = IB low, stop = IB high
     """
-    bias = (bias or "MIXED").upper()
-    d = _norm_ohlc(d)
-    w = _norm_ohlc(w)
-
-    def _inside_levels(df: pd.DataFrame):
-        if df.empty or len(df) < 2:
-            return None
+    def is_inside(df: pd.DataFrame) -> bool:
+        if df is None or df.empty or len(df) < 2:
+            return False
         cur, prev = df.iloc[-1], df.iloc[-2]
-        if candle_type(cur, prev) != "1":
-            return None
-        return float(cur["High"]), float(cur["Low"])
+        return (float(cur["High"]) <= float(prev["High"])) and (float(cur["Low"]) >= float(prev["Low"]))
 
-    wl = _inside_levels(w)
-    if wl:
-        hi, lo = wl
+    # Weekly first
+    if is_inside(w):
+        cur = w.iloc[-1]
+        hi, lo = float(cur["High"]), float(cur["Low"])
         if bias == "SHORT":
             return "W", lo, hi
         return "W", hi, lo
 
-    dl = _inside_levels(d)
-    if dl:
-        hi, lo = dl
+    if is_inside(d):
+        cur = d.iloc[-1]
+        hi, lo = float(cur["High"]), float(cur["Low"])
         if bias == "SHORT":
             return "D", lo, hi
         return "D", hi, lo
