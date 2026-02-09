@@ -12,6 +12,8 @@ from app_pages.rsi_dashboard import rsi_dashboard_main
 from app_pages.share_calculator import share_calculator_main
 from app_pages.guide import guide_main
 from app_pages.cheat_sheet import cheat_sheet_main
+from app_pages.strat_market_dashboard import strat_market_dashboard_main
+
 
 st.set_page_config(page_title="STRAT Scanner", layout="wide")
 
