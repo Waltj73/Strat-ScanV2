@@ -152,7 +152,8 @@ def _a_plus_score(
 
     return score, grade, " | ".join(notes)
 
-def _style_grades(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+def _style_grades(df: pd.DataFrame):
+
     """
     Highlight A+ rows.
     """
