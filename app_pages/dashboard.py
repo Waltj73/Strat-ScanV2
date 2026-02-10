@@ -286,55 +286,54 @@ def dashboard_main():
     df = df.sort_values(["_g", "GradeScore"], ascending=[True, False]).drop(columns=["_g"])
     df = df.head(top_n)
 
-    st.dataframe(_style_df(df), use_container_width=True, hide_index=True)
+        st.dataframe(_style_df(df), use_container_width=True, hide_index=True)
 
-st.caption(
-    "This ranks the best STRAT-style setups across the whole market universe "
-    "(market ETFs + sector ETFs + optional sector constituents)."
-)
+    st.caption(
+        "This ranks the best STRAT-style setups across the whole market universe "
+        "(market ETFs + sector ETFs + optional sector constituents)."
+    )
 
-# ===== Chart Viewer =====
-st.markdown("### Chart viewer")
+    # ---------- Chart viewer ----------
+    import plotly.graph_objects as go
+    from data.fetch import get_hist
 
-picked = st.selectbox(
-    "View chart for:",
-    df["Ticker"].tolist(),
-    index=0,
-)
+    if not df.empty:
+        st.markdown("### Chart viewer")
 
-bars = get_hist(picked)
+        picked = st.selectbox(
+            "View chart for:",
+            df["Ticker"].tolist(),
+            index=0,
+        )
 
-if bars is None or bars.empty:
-    st.warning("No data for that ticker.")
-else:
-    bars = bars.tail(220).copy()
+        bars = get_hist(picked)
 
-    cols = {c.lower(): c for c in bars.columns}
-    o = cols.get("open", "Open")
-    h = cols.get("high", "High")
-    l = cols.get("low", "Low")
-    c = cols.get("close", "Close")
+        if bars is None or bars.empty:
+            st.warning("No data for that ticker.")
+        else:
+            bars = bars.tail(220).copy()
 
-    fig = go.Figure(
-        data=[
-            go.Candlestick(
-                x=bars.index,
-                open=bars[o],
-                high=bars[h],
-                low=bars[l],
-                close=bars[c],
-                name=picked,
+            fig = go.Figure(
+                data=[
+                    go.Candlestick(
+                        x=bars.index,
+                        open=bars["Open"],
+                        high=bars["High"],
+                        low=bars["Low"],
+                        close=bars["Close"],
+                        name=picked,
+                    )
+                ]
             )
-        ]
-    )
 
-    fig.update_layout(
-        height=520,
-        xaxis_rangeslider_visible=False,
-        title=f"{picked} — Daily Candles",
-    )
+            fig.update_layout(
+                height=520,
+                xaxis_rangeslider_visible=False,
+                title=f"{picked} — Daily Candles",
+            )
 
-    st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True)
+
 
 
 
