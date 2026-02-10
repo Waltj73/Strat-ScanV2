@@ -1,12 +1,12 @@
 # app_pages/dashboard.py
-# Dashboard: STRAT-only Market Overview + A+ Market Leaders (Top 10–15)
+
+from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
-
 
 from data.fetch import get_hist, resample_ohlc
 from config.universe import MARKET_ETFS, SECTOR_ETFS, SECTOR_TICKERS
@@ -15,149 +15,82 @@ from strat.core import (
     compute_flags,
     score_regime,
     market_bias_and_strength,
-    best_trigger,
-    candle_color,
 )
 
-
-# -------------------------
-# Helpers (copied from scanner to keep grading consistent)
-# -------------------------
-def _tf_in_force(df: pd.DataFrame) -> str:
-    if df is None or df.empty or len(df) < 2:
-        return "—"
-
-    t = candle_type_label(df)
-    cur = df.iloc[-1]
-    col = candle_color(cur)
-
-    if t == "1":
-        return "Inside"
-    if t == "2U":
-        return "Bull IF" if col == "green" else "Bull"
-    if t == "2D":
-        return "Bear IF" if col == "red" else "Bear"
-    if t == "3":
-        if col == "green":
-            return "Bull IF"
-        if col == "red":
-            return "Bear IF"
-        return "3"
-    return "—"
+# -----------------------
+# Helpers
+# -----------------------
+def _checkify(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    out = df.copy()
+    for c in cols:
+        if c in out.columns:
+            out[c] = out[c].apply(lambda v: "✅" if bool(v) else "")
+    return out
 
 
-def _is_tf_supportive(force_label: str, bias: str) -> bool:
-    if bias == "LONG":
-        return isinstance(force_label, str) and force_label.startswith("Bull")
-    if bias == "SHORT":
-        return isinstance(force_label, str) and force_label.startswith("Bear")
-    return False
+def _grade_row(row: Dict) -> Tuple[str, int]:
+    """
+    Simple STRAT A+ grading heuristic (safe + explainable).
+    You can tune weights later.
 
+    Score components:
+      + 3 if Monthly aligns with bias (bull/bear)
+      + 2 if Weekly aligns with bias
+      + 1 if Daily aligns with bias
+      + 1 if W inside
+      + 1 if D inside
+    """
+    bias = row.get("_bias", "MIXED")
 
-def _setup_grade(bias: str, flags: dict, d_force: str, w_force: str, m_force: str, trigger_tf: str, entry, stop):
-    if bias not in ("LONG", "SHORT"):
-        return ("C", 0)
+    bull = int(row.get("BullScore", 0))
+    bear = int(row.get("BearScore", 0))
+    d_inside = bool(row.get("D_Inside", False))
+    w_inside = bool(row.get("W_Inside", False))
 
     score = 0
-    trigger_ready = (trigger_tf in ("D", "W")) and (entry is not None) and (stop is not None)
-    if trigger_ready:
-        score += 4
-
-    if _is_tf_supportive(w_force, bias):
-        score += 2
-    if _is_tf_supportive(m_force, bias):
-        score += 2
-
     if bias == "LONG":
-        if flags.get("W_212Up") or flags.get("D_212Up"):
-            score += 1
-    if bias == "SHORT":
-        if flags.get("W_212Dn") or flags.get("D_212Dn"):
-            score += 1
+        score += 3 if row.get("M_Bull", False) else 0
+        score += 2 if row.get("W_Bull", False) else 0
+        score += 1 if row.get("D_Bull", False) else 0
+    elif bias == "SHORT":
+        score += 3 if row.get("M_Bear", False) else 0
+        score += 2 if row.get("W_Bear", False) else 0
+        score += 1 if row.get("D_Bear", False) else 0
+    else:
+        # mixed: reward alignment either way but less “conviction”
+        score += 2 if (row.get("M_Bull", False) or row.get("M_Bear", False)) else 0
+        score += 1 if (row.get("W_Bull", False) or row.get("W_Bear", False)) else 0
 
-    if flags.get("M_Inside"):
-        score += 1
+    score += 1 if w_inside else 0
+    score += 1 if d_inside else 0
 
-    if bias == "LONG":
-        if w_force.startswith("Bear"):
-            score -= 2
-        if m_force.startswith("Bear"):
-            score -= 2
-    if bias == "SHORT":
-        if w_force.startswith("Bull"):
-            score -= 2
-        if m_force.startswith("Bull"):
-            score -= 2
-
-    if score >= 8:
-        return ("A+", score)
-    if score >= 6:
-        return ("A", score)
-    if score >= 4:
-        return ("B", score)
-    return ("C", score)
+    # Grade mapping
+    if score >= 7:
+        return "A+", score
+    if score >= 5:
+        return "A", score
+    if score >= 3:
+        return "B", score
+    return "C", score
 
 
-def _style_df(df: pd.DataFrame):
-    if df is None or df.empty:
-        return df
-
-    def grade_style(val):
-        if val == "A+":
-            return "background-color: rgba(0, 200, 0, 0.25); font-weight: 800;"
-        if val == "A":
-            return "background-color: rgba(0, 200, 0, 0.12); font-weight: 700;"
-        if val == "B":
-            return "background-color: rgba(255, 200, 0, 0.18); font-weight: 700;"
-        if val == "C":
-            return "background-color: rgba(180, 180, 180, 0.15);"
-        return ""
-
-    def force_style(val):
-        if isinstance(val, str) and val.endswith("IF"):
-            return "font-weight: 800;"
-        return ""
-
-    styler = df.style
-    if "SetupGrade" in df.columns:
-        styler = styler.applymap(grade_style, subset=["SetupGrade"])
-    for col in ["D_Force", "W_Force", "M_Force"]:
-        if col in df.columns:
-            styler = styler.applymap(force_style, subset=[col])
-    return styler
+def _style_grades_df(df: pd.DataFrame) -> pd.DataFrame:
+    # Keep it dependency-free: we’ll just add an emoji column.
+    out = df.copy()
+    out["GradeTag"] = out["SetupGrade"].map(
+        {"A+": "🔥 A+", "A": "✅ A", "B": "🟡 B", "C": "⚪ C"}
+    ).fillna(out["SetupGrade"])
+    return out
 
 
-def _build_market_universe(include_sector_tickers: bool = True, max_sector_tickers: int = 8) -> list[str]:
-    """
-    Universe for "overall market" scan.
-    - Always includes: MARKET_ETFS + SECTOR_ETFS
-    - Optionally includes a slice of tickers from each sector list
-      (keeps it from being too slow on Streamlit Cloud)
-    """
-    tickers = set()
-
-    # broad market ETFs
-    tickers.update(MARKET_ETFS.values())
-
-    # sector ETFs
-    tickers.update(SECTOR_ETFS.values())
-
-    if include_sector_tickers:
-        for _, lst in SECTOR_TICKERS.items():
-            for t in lst[:max_sector_tickers]:
-                tickers.add(t)
-
-    return sorted(tickers)
-
-
-# -------------------------
-# Main
-# -------------------------
+# -----------------------
+# Main Page
+# -----------------------
 def dashboard_main():
-    st.title("STRAT Dashboard")
-    st.caption("Market regime + STRAT-only sentiment + Top A+ setups across the overall market")
+    st.title("Dashboard (STRAT-only)")
+    st.caption("Overall STRAT Market Regime + A+ Leaders (with chart viewer)")
 
-    topbar = st.columns([1, 8])
+    topbar = st.columns([1, 7])
     with topbar[0]:
         if st.button("Refresh data"):
             st.cache_data.clear()
@@ -165,52 +98,48 @@ def dashboard_main():
 
     st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
-    # -------------------------
-    # Market Regime Summary
-    # -------------------------
+    # =========================
+    # MARKET REGIME
+    # =========================
     st.subheader("Market Regime (STRAT-only) — SPY / QQQ / IWM / DIA")
 
     market_rows = []
     for name, sym in MARKET_ETFS.items():
         d = get_hist(sym)
-        if d.empty:
+        if d is None or d.empty:
             flags = {}
             bull = bear = 0
             d_type = w_type = m_type = "n/a"
-            d_force = w_force = m_force = "—"
         else:
-            d_tf = d
-            w_tf = resample_ohlc(d, "W-FRI")
-            m_tf = resample_ohlc(d, "M")
-
-            d_type = candle_type_label(d_tf)
-            w_type = candle_type_label(w_tf)
-            m_type = candle_type_label(m_tf)
-
-            d_force = _tf_in_force(d_tf)
-            w_force = _tf_in_force(w_tf)
-            m_force = _tf_in_force(m_tf)
-
-            flags = compute_flags(d_tf, w_tf, m_tf)
+            w = resample_ohlc(d, "W-FRI")
+            m = resample_ohlc(d, "M")
+            flags = compute_flags(d, w, m)
             bull, bear = score_regime(flags)
+            d_type = candle_type_label(d)
+            w_type = candle_type_label(w)
+            m_type = candle_type_label(m)
 
-        market_rows.append({
-            "Market": name,
-            "Ticker": sym,
-            "D_Type": d_type,
-            "W_Type": w_type,
-            "M_Type": m_type,
-            "D_Force": d_force,
-            "W_Force": w_force,
-            "M_Force": m_force,
-            "BullScore": bull,
-            "BearScore": bear,
-        })
+        market_rows.append(
+            {
+                "Market": name,
+                "Ticker": sym,
+                "D_Type": d_type,
+                "W_Type": w_type,
+                "M_Type": m_type,
+                "BullScore": bull,
+                "BearScore": bear,
+                "D_Inside": flags.get("D_Inside", False),
+                "W_Inside": flags.get("W_Inside", False),
+                "M_Inside": flags.get("M_Inside", False),
+            }
+        )
 
     market_df = pd.DataFrame(market_rows)
-    st.dataframe(market_df, use_container_width=True, hide_index=True)
+    st.dataframe(_checkify(market_df, ["D_Inside", "W_Inside", "M_Inside"]),
+                 use_container_width=True, hide_index=True)
 
     bias, strength, diff = market_bias_and_strength(market_rows)
+
     if bias == "LONG":
         st.success(f"Bias: **LONG** 🟢 | STRAT Strength: **{strength}/100** | Bull–Bear diff: **{diff}**")
     elif bias == "SHORT":
@@ -218,123 +147,116 @@ def dashboard_main():
     else:
         st.warning(f"Bias: **MIXED** 🟠 | STRAT Strength: **{strength}/100** | Bull–Bear diff: **{diff}**")
 
-    # -------------------------
-    # A+ Market Leaders (Top 10–15)
-    # -------------------------
+    st.divider()
+
+    # =========================
+    # A+ LEADERS (overall market)
+    # =========================
     st.subheader("A+ Market Leaders (overall market, not sector-limited)")
 
-    c1, c2, c3 = st.columns([2, 2, 3])
+    c1, c2, c3 = st.columns([2, 2, 2])
     with c1:
         top_n = st.slider("Top count", 5, 30, 15)
     with c2:
         include_sector_tickers = st.toggle("Include sector tickers", value=True)
     with c3:
-        max_per_sector = st.slider("Max tickers per sector", 1, 25, 8)
+        max_per_sector = st.slider("Max tickers per sector", 3, 50, 10)
 
-    universe = _build_market_universe(include_sector_tickers=include_sector_tickers, max_sector_tickers=max_per_sector)
+    # Build universe
+    universe = []
+    universe += list(MARKET_ETFS.values())
+    universe += list(SECTOR_ETFS.values())
+
+    if include_sector_tickers:
+        for sector, tlist in SECTOR_TICKERS.items():
+            universe += tlist[:max_per_sector]
+
+    # De-dupe while preserving order
+    seen = set()
+    universe = [x for x in universe if not (x in seen or seen.add(x))]
 
     rows = []
-    for t in universe:
-        d = get_hist(t)
-        if d.empty:
+    for sym in universe:
+        d = get_hist(sym)
+        if d is None or d.empty:
             continue
 
-        d_tf = d
-        w_tf = resample_ohlc(d, "W-FRI")
-        m_tf = resample_ohlc(d, "M")
+        w = resample_ohlc(d, "W-FRI")
+        m = resample_ohlc(d, "M")
+        flags = compute_flags(d, w, m)
+        bull, bear = score_regime(flags)
 
-        flags = compute_flags(d_tf, w_tf, m_tf)
-        tf, entry, stop = best_trigger(bias, d_tf, w_tf)
+        row = {
+            "Ticker": sym,
+            "D_Type": candle_type_label(d),
+            "W_Type": candle_type_label(w),
+            "M_Type": candle_type_label(m),
+            "BullScore": bull,
+            "BearScore": bear,
+            "D_Inside": flags.get("D_Inside", False),
+            "W_Inside": flags.get("W_Inside", False),
+            "M_Inside": flags.get("M_Inside", False),
+            # keep flags for grading:
+            "D_Bull": flags.get("D_Bull", False),
+            "W_Bull": flags.get("W_Bull", False),
+            "M_Bull": flags.get("M_Bull", False),
+            "D_Bear": flags.get("D_Bear", False),
+            "W_Bear": flags.get("W_Bear", False),
+            "M_Bear": flags.get("M_Bear", False),
+            "_bias": bias,
+        }
 
-        d_force = _tf_in_force(d_tf)
-        w_force = _tf_in_force(w_tf)
-        m_force = _tf_in_force(m_tf)
+        grade, score = _grade_row(row)
+        row["SetupGrade"] = grade
+        row["GradeScore"] = score
 
-        grade, grade_score = _setup_grade(
-            bias=bias,
-            flags=flags,
-            d_force=d_force,
-            w_force=w_force,
-            m_force=m_force,
-            trigger_tf=tf,
-            entry=entry,
-            stop=stop,
-        )
+        rows.append(row)
 
-        rows.append({
-            "SetupGrade": grade,
-            "GradeScore": grade_score,
-            "Ticker": t,
-            "D_Type": candle_type_label(d_tf),
-            "W_Type": candle_type_label(w_tf),
-            "M_Type": candle_type_label(m_tf),
-            "D_Force": d_force,
-            "W_Force": w_force,
-            "M_Force": m_force,
-            "TriggerTF": tf if tf else "—",
-            "Entry": None if entry is None else round(float(entry), 2),
-            "Stop": None if stop is None else round(float(stop), 2),
-        })
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        st.info("No market leaders found (no data returned).")
+    if not rows:
+        st.info("No leaders found (data fetch may be empty right now).")
         return
 
-    grade_order = {"A+": 0, "A": 1, "B": 2, "C": 3}
-    df["_g"] = df["SetupGrade"].map(lambda x: grade_order.get(x, 9))
-    df = df.sort_values(["_g", "GradeScore"], ascending=[True, False]).drop(columns=["_g"])
-    df = df.head(top_n)
+    df = pd.DataFrame(rows)
 
-        st.dataframe(_style_df(df), use_container_width=True, hide_index=True)
+    # Sort best first
+    grade_rank = {"A+": 3, "A": 2, "B": 1, "C": 0}
+    df["_gr"] = df["SetupGrade"].map(grade_rank).fillna(0)
+    df = df.sort_values(["_gr", "GradeScore", "BullScore"], ascending=[False, False, False]).head(top_n)
+
+    show_cols = [
+        "SetupGrade", "GradeScore", "Ticker",
+        "D_Type", "W_Type", "M_Type",
+        "BullScore", "BearScore",
+        "D_Inside", "W_Inside", "M_Inside",
+    ]
+    out = df[show_cols].copy()
+    out = _checkify(out, ["D_Inside", "W_Inside", "M_Inside"])
+    out = _style_grades_df(out)
+
+    st.dataframe(out, use_container_width=True, hide_index=True)
 
     st.caption(
         "This ranks the best STRAT-style setups across the whole market universe "
         "(market ETFs + sector ETFs + optional sector constituents)."
     )
 
-    # ---------- Chart viewer ----------
-    import plotly.graph_objects as go
-    from data.fetch import get_hist
+    # =========================
+    # Chart Viewer (no Plotly)
+    # =========================
+    st.markdown("### Chart viewer (daily close)")
 
-    if not df.empty:
-        st.markdown("### Chart viewer")
+    picked = st.selectbox("View chart for:", df["Ticker"].tolist(), index=0)
 
-        picked = st.selectbox(
-            "View chart for:",
-            df["Ticker"].tolist(),
-            index=0,
-        )
+    bars = get_hist(picked)
+    if bars is None or bars.empty:
+        st.warning("No data for that ticker.")
+        return
 
-        bars = get_hist(picked)
+    bars = bars.tail(220).copy()
+    # Streamlit-native chart (fast + no dependencies)
+    st.line_chart(bars["Close"], height=320)
 
-        if bars is None or bars.empty:
-            st.warning("No data for that ticker.")
-        else:
-            bars = bars.tail(220).copy()
-
-            fig = go.Figure(
-                data=[
-                    go.Candlestick(
-                        x=bars.index,
-                        open=bars["Open"],
-                        high=bars["High"],
-                        low=bars["Low"],
-                        close=bars["Close"],
-                        name=picked,
-                    )
-                ]
-            )
-
-            fig.update_layout(
-                height=520,
-                xaxis_rangeslider_visible=False,
-                title=f"{picked} — Daily Candles",
-            )
-
-            st.plotly_chart(fig, use_container_width=True)
-
-
+    st.caption("Tip: If you want true candles + Strat trigger lines, we can add Plotly later (optional).")
 
 
 # Back-compat
