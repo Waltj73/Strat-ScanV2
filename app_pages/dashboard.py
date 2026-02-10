@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
+import plotly.graph_objects as go
+
 
 from data.fetch import get_hist, resample_ohlc
 from config.universe import MARKET_ETFS, SECTOR_ETFS, SECTOR_TICKERS
