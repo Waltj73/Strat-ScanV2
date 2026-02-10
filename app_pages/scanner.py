@@ -358,3 +358,8 @@ def show():
     )
 
     st.caption("Trigger levels are bias-aware. LONG = break IB high / stop below. SHORT = break IB low / stop above.")
+
+# Backwards compatibility for app.py routing
+def scanner_main():
+    show()
+
