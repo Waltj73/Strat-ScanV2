@@ -18,7 +18,6 @@ from strat.core import (
     best_trigger,
 )
 
-
 # -------------------------
 # Small utilities
 # -------------------------
@@ -28,6 +27,30 @@ def _checkify(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
         if c in out.columns:
             out[c] = out[c].apply(lambda v: "✅" if bool(v) else "")
     return out
+
+
+def _strength_trend_label(delta: int) -> str:
+    if delta >= 5:
+        return "RISING ✅"
+    if delta <= -5:
+        return "FALLING ⚠️"
+    return "FLAT"
+
+
+def _strength_badge(bias: str) -> str:
+    if bias == "LONG":
+        return "🟢"
+    if bias == "SHORT":
+        return "🔴"
+    return "🟠"
+
+
+def _strength_explain(strength: int, bias: str) -> str:
+    if bias == "LONG":
+        return "Higher = stronger LONG environment"
+    if bias == "SHORT":
+        return "Higher = stronger SHORT environment"
+    return "Higher = less mixed; lower = chop"
 
 
 def _rotation_lists(sectors_df: pd.DataFrame, bias: str, n: int = 3):
@@ -81,7 +104,7 @@ def _magnitude_to_target(
     compression = (last_rng / atr) if atr > 0 else None
 
     if entry is None or stop is None:
-        return None, atrp, None, (None if compression is None else float(compression))
+        return None, float(atrp), None, (None if compression is None else float(compression))
 
     hi63 = float(d["High"].rolling(63).max().iloc[-1])
     lo63 = float(d["Low"].rolling(63).min().iloc[-1])
@@ -146,19 +169,62 @@ def _grade_style(val: str) -> str:
     return "background-color: #5a1111; color: white; font-weight: 700;"
 
 
+# -------------------------
+# NEW: Universal STRAT strength snapshot for any symbol
+# -------------------------
+def _symbol_strength(sym: str, drop_last_bars: int = 0) -> Tuple[int, int, int, dict, str, str, str]:
+    """
+    Returns:
+      bull_score, bear_score, strength(0-100), flags, D_type, W_type, M_type
+    Strength is derived from bull-bear diff using same mapping as market_bias.
+    """
+    d = get_hist(sym)
+    if d is None or d.empty or len(d) < 10:
+        empty_flags = {
+            "D_Bull": False, "W_Bull": False, "M_Bull": False,
+            "D_Bear": False, "W_Bear": False, "M_Bear": False,
+            "D_Inside": False, "W_Inside": False, "M_Inside": False,
+            "D_212Up": False, "W_212Up": False, "D_212Dn": False, "W_212Dn": False,
+        }
+        return 0, 0, 50, empty_flags, "n/a", "n/a", "n/a"
+
+    df = d.copy()
+    if drop_last_bars > 0 and len(df) > drop_last_bars:
+        df = df.iloc[:-drop_last_bars].copy()
+
+    if df.empty or len(df) < 10:
+        empty_flags = {
+            "D_Bull": False, "W_Bull": False, "M_Bull": False,
+            "D_Bear": False, "W_Bear": False, "M_Bear": False,
+            "D_Inside": False, "W_Inside": False, "M_Inside": False,
+            "D_212Up": False, "W_212Up": False, "D_212Dn": False, "W_212Dn": False,
+        }
+        return 0, 0, 50, empty_flags, "n/a", "n/a", "n/a"
+
+    d_tf = df
+    w_tf = resample_ohlc(df, "W-FRI")
+    m_tf = resample_ohlc(df, "M")
+
+    d_type = candle_type_label(d_tf)
+    w_type = candle_type_label(w_tf)
+    m_type = candle_type_label(m_tf)
+
+    flags = compute_flags(d_tf, w_tf, m_tf)
+    bull, bear = score_regime(flags)
+
+    diff = int(bull - bear)
+    strength = int(np.clip(50 + diff * 5, 0, 100))
+    return int(bull), int(bear), int(strength), flags, d_type, w_type, m_type
+
+
 def _writeup_card(row: dict, bias: str):
     t = row["Ticker"]
     grade = row.get("Grade", "—")
     trig = row.get("TriggerStatus", "")
     tf = row.get("TriggerTF", "—")
-    entry = row.get("Entry")
-    stop = row.get("Stop")
-    room = row.get("Room")
-    rr = row.get("RR")
-    atrp = row.get("ATR%", None)
-    comp = row.get("Compression", None)
 
     st.markdown(f"#### {t} — Grade **{grade}** | Bias **{bias}**")
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.write(f"**Types:** D {row.get('D_Type','—')} | W {row.get('W_Type','—')} | M {row.get('M_Type','—')}")
@@ -166,11 +232,16 @@ def _writeup_card(row: dict, bias: str):
         st.write(f"**Trigger:** {trig}")
         st.write(f"**TF:** {tf}")
     with c3:
-        st.write(f"**Entry:** {entry if entry is not None else '—'}")
-        st.write(f"**Stop:** {stop if stop is not None else '—'}")
+        st.write(f"**Entry:** {row.get('Entry', '—')}")
+        st.write(f"**Stop:** {row.get('Stop', '—')}")
     with c4:
-        st.write(f"**Room (to 63d):** {room if room is not None else '—'}")
-        st.write(f"**RR:** {rr if rr is not None else '—'}")
+        st.write(f"**Room (to 63d):** {row.get('Room', '—')}")
+        st.write(f"**RR:** {row.get('RR', '—')}")
+
+    st.write(
+        f"**STRAT Strength:** {row.get('Strength', '—')}/100 "
+        f"({row.get('StrengthTrend','—')} | Δ {row.get('StrengthDelta','—')})"
+    )
 
     notes = []
     if bias in ("LONG", "SHORT"):
@@ -183,7 +254,8 @@ def _writeup_card(row: dict, bias: str):
     else:
         notes.append("No inside bar trigger → WAIT")
 
-    if comp is not None:
+    comp = row.get("Compression", None)
+    if comp is not None and isinstance(comp, (int, float)):
         if comp <= 0.6:
             notes.append("Very tight compression ✅")
         elif comp <= 0.9:
@@ -191,54 +263,20 @@ def _writeup_card(row: dict, bias: str):
         else:
             notes.append("Loose bar ⚠️")
 
-    if atrp is not None:
+    atrp = row.get("ATR%", None)
+    if atrp is not None and isinstance(atrp, (int, float)):
         notes.append(f"ATR% ~ {atrp:.2f}%")
 
     st.write("**Notes:** " + " | ".join(notes))
 
 
 # -------------------------
-# NEW: market strength trend (rising/falling)
+# Market snapshot (unchanged idea, reusing market_bias_and_strength)
 # -------------------------
 def _market_snapshot(drop_last_bars: int = 0) -> Tuple[str, int, int, pd.DataFrame]:
-    """
-    Returns (bias, strength, diff, market_df)
-    If drop_last_bars=1, computes yesterday/previous-bar snapshot.
-    """
     market_rows = []
     for name, sym in MARKET_ETFS.items():
-        d = get_hist(sym)
-        if d is None or d.empty or len(d) < 10:
-            d_type = w_type = m_type = "n/a"
-            flags = {}
-            bull = bear = 0
-            d_inside = w_inside = m_inside = False
-        else:
-            df = d.copy()
-            if drop_last_bars > 0 and len(df) > drop_last_bars:
-                df = df.iloc[:-drop_last_bars].copy()
-
-            if df.empty or len(df) < 10:
-                d_type = w_type = m_type = "n/a"
-                flags = {}
-                bull = bear = 0
-                d_inside = w_inside = m_inside = False
-            else:
-                d_tf = df
-                w_tf = resample_ohlc(df, "W-FRI")
-                m_tf = resample_ohlc(df, "M")
-
-                d_type = candle_type_label(d_tf)
-                w_type = candle_type_label(w_tf)
-                m_type = candle_type_label(m_tf)
-
-                flags = compute_flags(d_tf, w_tf, m_tf)
-                bull, bear = score_regime(flags)
-
-                d_inside = bool(flags.get("D_Inside", False))
-                w_inside = bool(flags.get("W_Inside", False))
-                m_inside = bool(flags.get("M_Inside", False))
-
+        bull, bear, strength, flags, d_type, w_type, m_type = _symbol_strength(sym, drop_last_bars=drop_last_bars)
         market_rows.append({
             "Market": name,
             "Ticker": sym,
@@ -247,43 +285,15 @@ def _market_snapshot(drop_last_bars: int = 0) -> Tuple[str, int, int, pd.DataFra
             "M_Type": m_type,
             "BullScore": bull,
             "BearScore": bear,
-            "D_Inside": d_inside,
-            "W_Inside": w_inside,
-            "M_Inside": m_inside,
+            "D_Inside": bool(flags.get("D_Inside", False)),
+            "W_Inside": bool(flags.get("W_Inside", False)),
+            "M_Inside": bool(flags.get("M_Inside", False)),
         })
 
-    bias, strength, diff = market_bias_and_strength(market_rows)
+    bias, strength_out, diff = market_bias_and_strength(market_rows)
     market_df = pd.DataFrame(market_rows)
     market_df = _checkify(market_df, ["D_Inside", "W_Inside", "M_Inside"])
-    return bias, int(strength), int(diff), market_df
-
-
-def _strength_trend_label(delta: int) -> str:
-    if delta >= 5:
-        return "RISING ✅"
-    if delta <= -5:
-        return "FALLING ⚠️"
-    return "FLAT"
-
-
-def _strength_badge(bias: str) -> str:
-    if bias == "LONG":
-        return "🟢"
-    if bias == "SHORT":
-        return "🔴"
-    return "🟠"
-
-
-def _strength_explain(strength: int, bias: str) -> str:
-    """
-    Clarifies what the number means for LONG vs SHORT:
-    - High strength = stronger bias in its direction
-    """
-    if bias == "LONG":
-        return "Higher = stronger LONG environment"
-    if bias == "SHORT":
-        return "Higher = stronger SHORT environment"
-    return "Higher = less mixed; lower = chop"
+    return bias, int(strength_out), int(diff), market_df
 
 
 # -------------------------
@@ -291,7 +301,7 @@ def _strength_explain(strength: int, bias: str) -> str:
 # -------------------------
 def show():
     st.title("Scanner (STRAT-only)")
-    st.caption("Market regime → sector dominance → drilldown. Includes Strength meter + trend + A/B/C rating + watchlist writeups.")
+    st.caption("Market regime → sector dominance → drilldown. Adds Strength meter + trend at Market, Sector, and Ticker levels.")
 
     topbar = st.columns([1, 1, 6])
     with topbar[0]:
@@ -302,7 +312,7 @@ def show():
     st.caption(f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
     # =========================
-    # MARKET REGIME (STRAT-only)
+    # MARKET REGIME
     # =========================
     st.subheader("Market Regime (STRAT-only) — SPY / QQQ / IWM / DIA")
 
@@ -312,10 +322,8 @@ def show():
     strength_delta = int(strength_now - strength_prev)
     diff_delta = int(diff_now - diff_prev)
 
-    # Market table
     st.dataframe(market_df, use_container_width=True, hide_index=True)
 
-    # Strength meter + trend
     badge = _strength_badge(bias_now)
     trend_txt = _strength_trend_label(strength_delta)
 
@@ -330,7 +338,6 @@ def show():
         st.write(f"**Strength trend:** {trend_txt}")
         st.caption(_strength_explain(strength_now, bias_now))
 
-    # Visual bar (quick “meter”)
     st.progress(max(0, min(100, strength_now)) / 100.0)
 
     if bias_now == "LONG":
@@ -340,31 +347,21 @@ def show():
     else:
         st.warning(f"Bias: **MIXED** 🟠 | Strength: **{strength_now}/100** | Diff: **{diff_now}** | Trend: **{trend_txt}**")
 
-    bias = bias_now  # use for the rest of the scanner
+    bias = bias_now
 
     # =========================
-    # SECTOR ROTATION (STRAT-only)
+    # SECTOR ROTATION (NOW WITH STRENGTH + TREND)
     # =========================
-    st.subheader("Sector Rotation (STRAT-only) — ranked by bias")
+    st.subheader("Sector Rotation (STRAT-only) — ranked by bias + Strength Trend")
 
     sector_rows = []
     for sector, etf in SECTOR_ETFS.items():
-        d = get_hist(etf)
-        if d is None or d.empty:
-            flags = {}
-            bull = bear = 0
-            d_type = w_type = m_type = "n/a"
-        else:
-            d_tf = d
-            w_tf = resample_ohlc(d, "W-FRI")
-            m_tf = resample_ohlc(d, "M")
+        bull, bear, strength, flags, d_type, w_type, m_type = _symbol_strength(etf, drop_last_bars=0)
+        bull_p, bear_p, strength_p, _, _, _, _ = _symbol_strength(etf, drop_last_bars=1)
 
-            d_type = candle_type_label(d_tf)
-            w_type = candle_type_label(w_tf)
-            m_type = candle_type_label(m_tf)
-
-            flags = compute_flags(d_tf, w_tf, m_tf)
-            bull, bear = score_regime(flags)
+        diff = int(bull - bear)
+        delta = int(strength - strength_p)
+        s_trend = _strength_trend_label(delta)
 
         sector_rows.append({
             "Sector": sector,
@@ -374,56 +371,69 @@ def show():
             "M_Type": m_type,
             "BullScore": bull,
             "BearScore": bear,
-            "D_Inside": flags.get("D_Inside", False),
-            "W_Inside": flags.get("W_Inside", False),
-            "M_Inside": flags.get("M_Inside", False),
-            "D_212Up": flags.get("D_212Up", False),
-            "W_212Up": flags.get("W_212Up", False),
-            "D_212Dn": flags.get("D_212Dn", False),
-            "W_212Dn": flags.get("W_212Dn", False),
+            "Diff": diff,
+            "Strength": strength,
+            "StrengthDelta": delta,
+            "StrengthTrend": s_trend,
+            "D_Inside": bool(flags.get("D_Inside", False)),
+            "W_Inside": bool(flags.get("W_Inside", False)),
+            "M_Inside": bool(flags.get("M_Inside", False)),
+            "D_212Up": bool(flags.get("D_212Up", False)),
+            "W_212Up": bool(flags.get("W_212Up", False)),
+            "D_212Dn": bool(flags.get("D_212Dn", False)),
+            "W_212Dn": bool(flags.get("W_212Dn", False)),
         })
 
     sectors_df = pd.DataFrame(sector_rows)
-    sectors_df["Diff"] = sectors_df["BullScore"] - sectors_df["BearScore"]
 
     if bias == "LONG":
-        sectors_df = sectors_df.sort_values(["Diff", "BullScore"], ascending=[False, False])
+        sectors_df = sectors_df.sort_values(["Diff", "Strength", "StrengthDelta"], ascending=[False, False, False])
     elif bias == "SHORT":
-        sectors_df = sectors_df.sort_values(["Diff", "BearScore"], ascending=[True, False])
+        sectors_df = sectors_df.sort_values(["Diff", "Strength", "StrengthDelta"], ascending=[True, False, False])
     else:
-        sectors_df = sectors_df.sort_values(["Diff"], ascending=False)
+        sectors_df = sectors_df.sort_values(["Strength", "StrengthDelta"], ascending=[False, False])
 
-    show_cols = [
-        "Sector", "ETF", "D_Type", "W_Type", "M_Type",
-        "BullScore", "BearScore", "Diff",
-        "D_Inside", "W_Inside", "M_Inside",
-        "D_212Up", "W_212Up", "D_212Dn", "W_212Dn"
-    ]
-    out_df = sectors_df[show_cols].copy()
+    out_df = sectors_df[
+        [
+            "Sector", "ETF", "D_Type", "W_Type", "M_Type",
+            "BullScore", "BearScore", "Diff",
+            "Strength", "StrengthDelta", "StrengthTrend",
+            "D_Inside", "W_Inside", "M_Inside",
+            "D_212Up", "W_212Up", "D_212Dn", "W_212Dn"
+        ]
+    ].copy()
+
     out_df = _checkify(out_df, ["D_Inside", "W_Inside", "M_Inside", "D_212Up", "W_212Up", "D_212Dn", "W_212Dn"])
     st.dataframe(out_df, use_container_width=True, hide_index=True)
 
     # =========================
-    # QUICK MARKET READ + ROTATION IN/OUT
+    # ROTATION IN/OUT (NOW ALSO SHOWS STRENGTH + TREND)
     # =========================
-    st.subheader("Quick Market Read + Rotation IN/OUT")
+    st.subheader("Quick Market Read + Rotation IN/OUT (STRAT-only)")
+
     rot_in, rot_out = _rotation_lists(sectors_df, bias, n=3)
 
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("### 🔁 Rotation IN")
         for _, r in rot_in.iterrows():
-            st.write(f"✅ **{r['Sector']}** ({r['ETF']}) — Bull {int(r['BullScore'])} / Bear {int(r['BearScore'])} | Diff {int(r['Diff'])}")
+            st.write(
+                f"✅ **{r['Sector']}** ({r['ETF']}) — "
+                f"Diff {int(r['Diff'])} | Strength {int(r['Strength'])}/100 ({r['StrengthTrend']} Δ {int(r['StrengthDelta'])})"
+            )
 
     with c2:
         st.markdown("### 🔁 Rotation OUT")
         for _, r in rot_out.iterrows():
-            st.write(f"❌ **{r['Sector']}** ({r['ETF']}) — Bull {int(r['BullScore'])} / Bear {int(r['BearScore'])} | Diff {int(r['Diff'])}")
+            st.write(
+                f"❌ **{r['Sector']}** ({r['ETF']}) — "
+                f"Diff {int(r['Diff'])} | Strength {int(r['Strength'])}/100 ({r['StrengthTrend']} Δ {int(r['StrengthDelta'])})"
+            )
 
     # =========================
-    # DRILL INTO A SECTOR
+    # DRILLDOWN (TICKERS NOW GET STRENGTH + TREND TOO)
     # =========================
-    st.subheader("Drill into a Sector (scan tickers inside that group)")
+    st.subheader("Drill into a Sector (tickers inside that group) — includes Strength + Magnitude + Grades")
 
     left, right = st.columns([2, 1])
     with left:
@@ -446,11 +456,15 @@ def show():
         if d is None or d.empty:
             continue
 
+        # strength + trend for this ticker
+        bull, bear, strength, flags, d_type, w_type, m_type = _symbol_strength(t, drop_last_bars=0)
+        bull_p, bear_p, strength_p, _, _, _, _ = _symbol_strength(t, drop_last_bars=1)
+        s_delta = int(strength - strength_p)
+        s_trend = _strength_trend_label(s_delta)
+
         d_tf = d
         w_tf = resample_ohlc(d, "W-FRI")
-        m_tf = resample_ohlc(d, "M")
 
-        flags = compute_flags(d_tf, w_tf, m_tf)
         tf, entry, stop = best_trigger(bias, d_tf, w_tf)
 
         rr, atrp, room, compression = _magnitude_to_target(
@@ -465,33 +479,33 @@ def show():
         m_inside = bool(flags.get("M_Inside"))
         trigger_status = f"D: {'READY' if d_ready else 'WAIT'} | W: {'READY' if w_ready else 'WAIT'} | M: {'INSIDE' if m_inside else '—'}"
 
-        full = {}
-        full.update(flags)
-        full["Ticker"] = t
-        full["TriggerTF"] = tf if tf else "—"
-        full["Entry"] = None if entry is None else round(float(entry), 2)
-        full["Stop"] = None if stop is None else round(float(stop), 2)
-        full["Room"] = None if room is None else round(float(room), 2)
-        full["RR"] = None if rr is None else round(float(rr), 2)
-        full["ATR%"] = None if atrp is None else round(float(atrp), 2)
-        full["Compression"] = None if compression is None else round(float(compression), 2)
-        full["TriggerStatus"] = trigger_status
+        rec = {}
+        rec.update(flags)
+        rec["Ticker"] = t
+        rec["D_Type"] = d_type
+        rec["W_Type"] = w_type
+        rec["M_Type"] = m_type
 
-        full["D_Type"] = candle_type_label(d_tf)
-        full["W_Type"] = candle_type_label(w_tf)
-        full["M_Type"] = candle_type_label(m_tf)
+        rec["BullScore"] = bull
+        rec["BearScore"] = bear
+        rec["Diff"] = int(bull - bear)
 
-        full["D_Inside"] = bool(flags.get("D_Inside", False))
-        full["W_Inside"] = bool(flags.get("W_Inside", False))
-        full["M_Inside"] = bool(flags.get("M_Inside", False))
-        full["D_212Up"] = bool(flags.get("D_212Up", False))
-        full["W_212Up"] = bool(flags.get("W_212Up", False))
-        full["D_212Dn"] = bool(flags.get("D_212Dn", False))
-        full["W_212Dn"] = bool(flags.get("W_212Dn", False))
+        rec["Strength"] = strength
+        rec["StrengthDelta"] = s_delta
+        rec["StrengthTrend"] = s_trend
 
-        g = _grade_setup(
+        rec["TriggerTF"] = tf if tf else "—"
+        rec["Entry"] = None if entry is None else round(float(entry), 2)
+        rec["Stop"] = None if stop is None else round(float(stop), 2)
+        rec["Room"] = None if room is None else round(float(room), 2)
+        rec["RR"] = None if rr is None else round(float(rr), 2)
+        rec["ATR%"] = None if atrp is None else round(float(atrp), 2)
+        rec["Compression"] = None if compression is None else round(float(compression), 2)
+        rec["TriggerStatus"] = trigger_status
+
+        rec["Grade"] = _grade_setup(
             bias=bias,
-            flags=full,
+            flags=rec,
             entry=entry,
             stop=stop,
             rr=rr,
@@ -499,9 +513,8 @@ def show():
             atrp=atrp,
             compression=compression,
         )
-        full["Grade"] = g
 
-        rows.append(full)
+        rows.append(rec)
 
     scan_df = pd.DataFrame(rows)
     if scan_df.empty:
@@ -515,6 +528,7 @@ def show():
     show_tbl = table_df[
         [
             "Ticker", "Grade",
+            "Strength", "StrengthDelta", "StrengthTrend",
             "D_Type", "W_Type", "M_Type",
             "W_Inside", "D_Inside",
             "TriggerTF", "Entry", "Stop",
@@ -527,7 +541,11 @@ def show():
     show_tbl["_gr"] = show_tbl["Grade"].map(lambda x: grade_rank.get(str(x), 9))
     show_tbl["_rr"] = pd.to_numeric(show_tbl["RR"], errors="coerce")
     show_tbl["_room"] = pd.to_numeric(show_tbl["Room"], errors="coerce")
-    show_tbl = show_tbl.sort_values(["_gr", "_rr", "_room"], ascending=[True, False, False]).drop(columns=["_gr", "_rr", "_room"])
+    show_tbl["_str"] = pd.to_numeric(show_tbl["Strength"], errors="coerce")
+    show_tbl = (
+        show_tbl.sort_values(["_gr", "_str", "_rr", "_room"], ascending=[True, False, False, False])
+        .drop(columns=["_gr", "_rr", "_room", "_str"])
+    )
 
     st.dataframe(show_tbl.style.applymap(_grade_style, subset=["Grade"]), use_container_width=True, hide_index=True)
 
@@ -543,18 +561,25 @@ def show():
     tmp["GradeRank"] = tmp["Grade"].map(lambda x: {"A": 0, "B": 1, "C": 2}.get(str(x), 9))
     tmp["RR_num"] = pd.to_numeric(tmp["RR"], errors="coerce").fillna(-1)
     tmp["Room_num"] = pd.to_numeric(tmp["Room"], errors="coerce").fillna(-1)
+    tmp["Str_num"] = pd.to_numeric(tmp["Strength"], errors="coerce").fillna(-1)
 
-    watch = tmp.sort_values(["GradeRank", "HasTrigger", "RR_num", "Room_num"], ascending=[True, False, False, False]).head(int(wl_n))
+    watch = tmp.sort_values(
+        ["GradeRank", "HasTrigger", "Str_num", "RR_num", "Room_num"],
+        ascending=[True, False, False, False, False]
+    ).head(int(wl_n))
 
     if watch.empty:
         st.warning("No watchlist under current scan settings (try increasing Scan count).")
     else:
-        wl_table = watch[["Ticker", "Grade", "TriggerTF", "Entry", "Stop", "Room", "RR", "ATR%", "Compression", "TriggerStatus"]].copy()
+        wl_table = watch[
+            ["Ticker", "Grade", "Strength", "StrengthDelta", "StrengthTrend",
+             "TriggerTF", "Entry", "Stop", "Room", "RR", "ATR%", "Compression", "TriggerStatus"]
+        ].copy()
         st.dataframe(wl_table.style.applymap(_grade_style, subset=["Grade"]), use_container_width=True, hide_index=True)
 
         st.markdown("### 📌 Writeups (click to expand)")
         for rec in watch.to_dict("records"):
-            title = f"{rec['Ticker']} | Grade {rec['Grade']} | {rec.get('TriggerStatus','')}"
+            title = f"{rec['Ticker']} | Grade {rec['Grade']} | Strength {rec['Strength']}/100 ({rec['StrengthTrend']} Δ {rec['StrengthDelta']}) | {rec.get('TriggerStatus','')}"
             with st.expander(title):
                 _writeup_card(rec, bias)
 
