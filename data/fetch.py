@@ -6,17 +6,19 @@ import yfinance as yf
 REQUIRED_COLS = ["Open", "High", "Low", "Close", "Volume"]
 
 # =========================
-# CLEAN INDEX
+# INDEX CLEANING
 # =========================
 def _ensure_datetime_index(df):
     if df is None or df.empty:
         return pd.DataFrame()
 
     df = df.copy()
+
+    # Force datetime index ALWAYS
     df.index = pd.to_datetime(df.index, errors="coerce")
     df = df[~df.index.isna()]
-    df = df.sort_index()
 
+    # Remove timezone issues
     try:
         df.index = df.index.tz_localize(None)
     except Exception:
@@ -25,29 +27,40 @@ def _ensure_datetime_index(df):
         except Exception:
             pass
 
+    df = df.sort_index()
     df = df[~df.index.duplicated(keep="last")]
 
     return df
 
 
 # =========================
-# CLEAN YFINANCE DATA
+# FETCH DATA
 # =========================
-def _flatten_yf_columns(df, ticker):
+@st.cache_data(ttl=60 * 20, show_spinner=False)
+def get_hist(ticker: str, period: str = "3y"):
+
+    try:
+        df = yf.download(
+            ticker,
+            period=period,
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+        )
+    except Exception:
+        return pd.DataFrame()
+
     if df is None or df.empty:
         return pd.DataFrame()
 
     df = _ensure_datetime_index(df)
-    if df.empty:
-        return pd.DataFrame()
 
-    # Flatten multi-index columns
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-
+    # Flatten columns if needed
+    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
     df.columns = [str(c).title() for c in df.columns]
 
-    if "Adj Close" in df.columns and "Close" not in df.columns:
+    # Ensure Close exists
+    if "Adj Close" in df.columns:
         df["Close"] = df["Adj Close"]
 
     if "Volume" not in df.columns:
@@ -69,30 +82,7 @@ def _flatten_yf_columns(df, ticker):
 
 
 # =========================
-# FETCH DATA
-# =========================
-@st.cache_data(ttl=60 * 20, show_spinner=False)
-def get_hist(ticker: str, period: str = "3y"):
-
-    try:
-        raw = yf.download(
-            ticker,
-            period=period,
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-        )
-    except Exception:
-        return pd.DataFrame()
-
-    df = _flatten_yf_columns(raw, ticker)
-    df = _ensure_datetime_index(df)
-
-    return df
-
-
-# =========================
-# RESAMPLE (FINAL FIX)
+# RESAMPLE (ABSOLUTE FIX)
 # =========================
 def resample_ohlc(df, rule):
 
@@ -104,15 +94,17 @@ def resample_ohlc(df, rule):
     if df.empty:
         return pd.DataFrame()
 
-    # 🔥 HARD FIX — NEVER LET "M" HIT PANDAS
-    rule = str(rule).strip().upper()
+    # 🔥 FORCE RULE SAFELY (THIS IS THE FIX)
+    rule_map = {
+        "M": "ME",
+        "W": "W-FRI",
+        "D": "D",
+        "ME": "ME",
+        "W-FRI": "W-FRI"
+    }
 
-    if rule == "M":
-        rule = "ME"
-    elif rule == "W":
-        rule = "W-FRI"
-    elif rule not in ["ME", "W-FRI", "D"]:
-        return pd.DataFrame()
+    rule = str(rule).strip().upper()
+    rule = rule_map.get(rule, "ME")  # default to safe value
 
     df = df.dropna(subset=["Open", "High", "Low", "Close"])
 
@@ -120,7 +112,7 @@ def resample_ohlc(df, rule):
         return pd.DataFrame()
 
     try:
-        resampled = df.resample(rule).agg({
+        out = df.resample(rule).agg({
             "Open": "first",
             "High": "max",
             "Low": "min",
@@ -130,4 +122,4 @@ def resample_ohlc(df, rule):
     except Exception:
         return pd.DataFrame()
 
-    return resampled.dropna()
+    return out.dropna()
