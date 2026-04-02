@@ -153,7 +153,7 @@ def get_hist(ticker: str, period: str = "3y") -> pd.DataFrame:
 
     df = _flatten_yf_columns(raw, ticker)
 
-    # 🔥 FINAL SAFETY (prevents ALL resample crashes)
+    # FINAL SAFETY
     df = _ensure_datetime_index(df)
 
     return df
@@ -173,6 +173,12 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
+    # 🔥 FIX: normalize pandas frequency
+    if rule == "M":
+        rule = "ME"
+    elif rule == "W":
+        rule = "W-FRI"
+
     # Force numeric columns
     for c in REQUIRED_COLS:
         if c in df.columns:
@@ -185,7 +191,6 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
-    # Safe aggregators
     def safe_first(x):
         x = x.dropna()
         return x.iloc[0] if len(x) else np.nan
@@ -194,7 +199,6 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
         x = x.dropna()
         return x.iloc[-1] if len(x) else np.nan
 
-    # 🔥 CRITICAL FIX
     try:
         g = df.resample(rule)
     except Exception:
