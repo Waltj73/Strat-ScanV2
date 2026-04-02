@@ -112,7 +112,7 @@ def dashboard_main():
             d_type = w_type = m_type = "n/a"
         else:
             w = resample_ohlc(d, "W-FRI")
-            m = resample_ohlc(d, "M")
+            m = resample_ohlc(d, "ME")
             flags = compute_flags(d, w, m)
             bull, bear = score_regime(flags)
             d_type = candle_type_label(d)
