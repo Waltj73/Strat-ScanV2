@@ -6,61 +6,51 @@ import yfinance as yf
 REQUIRED_COLS = ["Open", "High", "Low", "Close", "Volume"]
 
 # =========================
-# INDEX CLEANING
+# CLEAN INDEX
 # =========================
-def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+def _ensure_datetime_index(df):
     if df is None or df.empty:
         return pd.DataFrame()
 
     df = df.copy()
-
     df.index = pd.to_datetime(df.index, errors="coerce")
     df = df[~df.index.isna()]
+    df = df.sort_index()
 
     try:
         df.index = df.index.tz_localize(None)
-    except Exception:
-        try:
-            df.index = df.index.tz_convert(None)
-        except Exception:
-            pass
-
-    df = df.sort_index()
-    df = df[~df.index.duplicated(keep="last")]
+    except:
+        pass
 
     return df
 
 
 # =========================
-# COLUMN CLEANING
+# FETCH DATA
 # =========================
-def _dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
+@st.cache_data(ttl=60 * 20, show_spinner=False)
+def get_hist(ticker: str, period: str = "3y"):
+
+    try:
+        df = yf.download(
+            ticker,
+            period=period,
+            interval="1d",
+            progress=False,
+        )
+    except:
         return pd.DataFrame()
 
-    if df.columns.duplicated().any():
-        df = df.loc[:, ~df.columns.duplicated(keep="first")].copy()
-
-    return df
-
-
-# =========================
-# YFINANCE CLEANING
-# =========================
-def _flatten_yf_columns(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
     df = _ensure_datetime_index(df)
-    if df.empty:
-        return pd.DataFrame()
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-
+    # Normalize columns
+    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
     df.columns = [str(c).title() for c in df.columns]
 
-    if "Adj Close" in df.columns and "Close" not in df.columns:
+    if "Adj Close" in df.columns:
         df["Close"] = df["Adj Close"]
 
     if "Volume" not in df.columns:
@@ -76,37 +66,15 @@ def _flatten_yf_columns(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     for c in needed:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    df = df.dropna()
 
     return df
 
 
 # =========================
-# DATA FETCH
+# RESAMPLE (FINAL FIX)
 # =========================
-@st.cache_data(ttl=60 * 20, show_spinner=False)
-def get_hist(ticker: str, period: str = "3y") -> pd.DataFrame:
-    try:
-        raw = yf.download(
-            ticker,
-            period=period,
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-        )
-    except Exception:
-        return pd.DataFrame()
-
-    df = _flatten_yf_columns(raw, ticker)
-    df = _ensure_datetime_index(df)
-
-    return df
-
-
-# =========================
-# RESAMPLING (HARD FIX)
-# =========================
-def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+def resample_ohlc(df, rule):
 
     if df is None or df.empty:
         return pd.DataFrame()
@@ -116,12 +84,7 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
-    # 🔥 FORCE VALID RULE (NO EXCEPTIONS)
-    if not isinstance(rule, str):
-        return pd.DataFrame()
-
-    rule = rule.strip().upper()
-
+    # 🔥 FORCE SAFE RULES ONLY
     if rule == "M":
         rule = "ME"
     elif rule == "W":
@@ -129,31 +92,17 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     elif rule not in ["ME", "W-FRI", "D"]:
         return pd.DataFrame()
 
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
-
-    if df.empty:
-        return pd.DataFrame()
-
-    def safe_first(x):
-        return x.iloc[0] if len(x) else np.nan
-
-    def safe_last(x):
-        return x.iloc[-1] if len(x) else np.nan
-
-    # 🔥 GUARANTEED SAFE RESAMPLE
     try:
-        g = df.resample(rule)
-    except Exception:
+        resampled = df.resample(rule).agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum"
+        })
+    except:
         return pd.DataFrame()
 
-    out = pd.DataFrame({
-        "Open": g["Open"].apply(safe_first),
-        "High": g["High"].max(),
-        "Low": g["Low"].min(),
-        "Close": g["Close"].apply(safe_last),
-        "Volume": g["Volume"].sum(),
-    })
+    resampled = resampled.dropna()
 
-    out = out.dropna()
-
-    return out
+    return resampled
