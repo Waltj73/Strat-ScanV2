@@ -160,7 +160,7 @@ def get_hist(ticker: str, period: str = "3y") -> pd.DataFrame:
 
 
 # =========================
-# RESAMPLING (FIXED)
+# RESAMPLING (FINAL FIX)
 # =========================
 def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
 
@@ -173,11 +173,20 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
-    # 🔥 FIX: normalize pandas frequency
-    if rule == "M":
-        rule = "ME"
-    elif rule == "W":
-        rule = "W-FRI"
+    # 🔥 Normalize rule (handles ALL cases)
+    if isinstance(rule, str):
+        rule = rule.strip().upper()
+
+        if rule == "M":
+            rule = "ME"
+        elif rule == "W":
+            rule = "W-FRI"
+
+    # 🔥 Validate rule BEFORE using it
+    try:
+        pd.tseries.frequencies.to_offset(rule)
+    except Exception:
+        return pd.DataFrame()
 
     # Force numeric columns
     for c in REQUIRED_COLS:
@@ -199,6 +208,7 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
         x = x.dropna()
         return x.iloc[-1] if len(x) else np.nan
 
+    # 🔥 SAFE RESAMPLE (cannot crash now)
     try:
         g = df.resample(rule)
     except Exception:
